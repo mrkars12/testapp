@@ -1,0 +1,153 @@
+  ● funds_secured checkout (integration) › when the money is secured › creates the order
+
+    PrismaClientKnownRequestError: 
+    Invalid `prisma.$queryRaw()` invocation:
+
+
+    Raw query failed. Code: `N/A`. Message: `Failed to deserialize column of type 'void'. If you're using $queryRaw and this column is explicitly marked as `Unsupported` in your Prisma schema, try casting this column to any supported Prisma type such as `String`.`
+
+      381 |   ): Promise<bigint> {
+      382 |     const lockKey = `beneficiary:${storeId}:${mode}`
+    > 383 |     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`
+          |     ^
+      384 |
+      385 |     const existing = await tx.beneficiary.findFirst({
+      386 |       where: { store_id: storeId, mode, kind: 'store', external_ref: null },
+
+      at ei.handleRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:228:13)
+      at ei.handleAndLogRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:174:12)
+      at ei.request (node_modules/@prisma/client/src/runtime/RequestHandler.ts:143:12)
+      at a (node_modules/@prisma/client/src/runtime/getPrismaClient.ts:833:24)
+      at PaymentFactApplier.findBeneficiary (src/stores/payments/facts/payment-fact.applier.ts:383:5)
+--
+  ● funds_secured checkout (integration) › when the money is secured › takes the held stock
+
+    PrismaClientKnownRequestError: 
+    Invalid `prisma.$queryRaw()` invocation:
+
+
+    Raw query failed. Code: `N/A`. Message: `Failed to deserialize column of type 'void'. If you're using $queryRaw and this column is explicitly marked as `Unsupported` in your Prisma schema, try casting this column to any supported Prisma type such as `String`.`
+
+      381 |   ): Promise<bigint> {
+      382 |     const lockKey = `beneficiary:${storeId}:${mode}`
+    > 383 |     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`
+          |     ^
+      384 |
+      385 |     const existing = await tx.beneficiary.findFirst({
+      386 |       where: { store_id: storeId, mode, kind: 'store', external_ref: null },
+
+      at ei.handleRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:228:13)
+      at ei.handleAndLogRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:174:12)
+      at ei.request (node_modules/@prisma/client/src/runtime/RequestHandler.ts:143:12)
+      at a (node_modules/@prisma/client/src/runtime/getPrismaClient.ts:833:24)
+      at PaymentFactApplier.findBeneficiary (src/stores/payments/facts/payment-fact.applier.ts:383:5)
+--
+  ● funds_secured checkout (integration) › when the money is secured › posts a balanced gateway receivable
+
+    PrismaClientKnownRequestError: 
+    Invalid `prisma.$queryRaw()` invocation:
+
+
+    Raw query failed. Code: `N/A`. Message: `Failed to deserialize column of type 'void'. If you're using $queryRaw and this column is explicitly marked as `Unsupported` in your Prisma schema, try casting this column to any supported Prisma type such as `String`.`
+
+      381 |   ): Promise<bigint> {
+      382 |     const lockKey = `beneficiary:${storeId}:${mode}`
+    > 383 |     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`
+          |     ^
+      384 |
+      385 |     const existing = await tx.beneficiary.findFirst({
+      386 |       where: { store_id: storeId, mode, kind: 'store', external_ref: null },
+
+      at ei.handleRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:228:13)
+      at ei.handleAndLogRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:174:12)
+      at ei.request (node_modules/@prisma/client/src/runtime/RequestHandler.ts:143:12)
+      at a (node_modules/@prisma/client/src/runtime/getPrismaClient.ts:833:24)
+      at PaymentFactApplier.findBeneficiary (src/stores/payments/facts/payment-fact.applier.ts:383:5)
+--
+  ● funds_secured checkout (integration) › when the money is secured › links the checkout to the order
+
+    PrismaClientKnownRequestError: 
+    Invalid `prisma.$queryRaw()` invocation:
+
+
+    Raw query failed. Code: `N/A`. Message: `Failed to deserialize column of type 'void'. If you're using $queryRaw and this column is explicitly marked as `Unsupported` in your Prisma schema, try casting this column to any supported Prisma type such as `String`.`
+
+      381 |   ): Promise<bigint> {
+      382 |     const lockKey = `beneficiary:${storeId}:${mode}`
+    > 383 |     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`
+          |     ^
+      384 |
+      385 |     const existing = await tx.beneficiary.findFirst({
+      386 |       where: { store_id: storeId, mode, kind: 'store', external_ref: null },
+
+      at ei.handleRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:228:13)
+      at ei.handleAndLogRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:174:12)
+      at ei.request (node_modules/@prisma/client/src/runtime/RequestHandler.ts:143:12)
+      at a (node_modules/@prisma/client/src/runtime/getPrismaClient.ts:833:24)
+      at PaymentFactApplier.findBeneficiary (src/stores/payments/facts/payment-fact.applier.ts:383:5)
+--
+  ● funds_secured checkout (integration) › when the money is secured › does not create a second order when the capture is redelivered
+
+    PrismaClientKnownRequestError: 
+    Invalid `prisma.$queryRaw()` invocation:
+
+
+    Raw query failed. Code: `N/A`. Message: `Failed to deserialize column of type 'void'. If you're using $queryRaw and this column is explicitly marked as `Unsupported` in your Prisma schema, try casting this column to any supported Prisma type such as `String`.`
+
+      381 |   ): Promise<bigint> {
+      382 |     const lockKey = `beneficiary:${storeId}:${mode}`
+    > 383 |     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`
+          |     ^
+      384 |
+      385 |     const existing = await tx.beneficiary.findFirst({
+      386 |       where: { store_id: storeId, mode, kind: 'store', external_ref: null },
+
+      at ei.handleRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:228:13)
+      at ei.handleAndLogRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:174:12)
+      at ei.request (node_modules/@prisma/client/src/runtime/RequestHandler.ts:143:12)
+      at a (node_modules/@prisma/client/src/runtime/getPrismaClient.ts:833:24)
+      at PaymentFactApplier.findBeneficiary (src/stores/payments/facts/payment-fact.applier.ts:383:5)
+--
+  ● funds_secured checkout (integration) › when the money is secured › does not double-decrement stock on redelivery
+
+    PrismaClientKnownRequestError: 
+    Invalid `prisma.$queryRaw()` invocation:
+
+
+    Raw query failed. Code: `N/A`. Message: `Failed to deserialize column of type 'void'. If you're using $queryRaw and this column is explicitly marked as `Unsupported` in your Prisma schema, try casting this column to any supported Prisma type such as `String`.`
+
+      381 |   ): Promise<bigint> {
+      382 |     const lockKey = `beneficiary:${storeId}:${mode}`
+    > 383 |     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`
+          |     ^
+      384 |
+      385 |     const existing = await tx.beneficiary.findFirst({
+      386 |       where: { store_id: storeId, mode, kind: 'store', external_ref: null },
+
+      at ei.handleRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:228:13)
+      at ei.handleAndLogRequestError (node_modules/@prisma/client/src/runtime/RequestHandler.ts:174:12)
+      at ei.request (node_modules/@prisma/client/src/runtime/RequestHandler.ts:143:12)
+      at a (node_modules/@prisma/client/src/runtime/getPrismaClient.ts:833:24)
+      at PaymentFactApplier.findBeneficiary (src/stores/payments/facts/payment-fact.applier.ts:383:5)
+--
+  ● funds_secured checkout (integration) › when the money is secured › creates exactly one order under two parallel deliveries
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 0
+
+      372 |         ])
+      373 |
+    > 374 |         expect(await prisma.order.count()).toBe(1)
+          |                                            ^
+      375 |         expect(await prisma.capture.count()).toBe(1)
+      376 |         expect(await ledger.findUnbalancedEntries()).toEqual([])
+      377 |       } finally {
+
+      at Object.<anonymous> (src/stores/checkout/funds-secured.integration.spec.ts:374:44)
+
+[32m[Nest] 172916  - [39m08/08/2026, 12:15:39 AM [32m    LOG[39m [38;5;3m[EnvKeyProvider] [39m[32m🔑 KEK v1 [current] KCV=2d7e7fb7[39m
+[32m[Nest] 172916  - [39m08/08/2026, 12:15:40 AM [32m    LOG[39m [38;5;3m[PaymentAccountService] [39m[32mحساب دفع اتحفظ: متجر 1 / stripe / live / Default (بيانات اعتماد اتحدّثت)[39m
+[32m[Nest] 172916  - [39m08/08/2026, 12:15:40 AM [32m    LOG[39m [38;5;3m[PaymentAccountService] [39m[32mحساب دفع اتحفظ: متجر 1 / stripe / live / Default (بيانات اعتماد اتحدّثت)[39m
+[32m[Nest] 172916  - [39m08/08/2026, 12:15:40 AM [32m    LOG[39m [38;5;3m[PaymentAccountService] [39m[32mحساب دفع اتحفظ: متجر 1 / paymob / live / Default (بيانات اعتماد اتحدّثت)[39m

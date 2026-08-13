@@ -4,29 +4,33 @@ import {
   Injectable,
   Logger,
   NotFoundException,
-} from '@nestjs/common'
-import { randomUUID } from 'crypto'
-import { Prisma } from '@prisma/client'
+} from '@nestjs/common';
+import { randomUUID } from 'crypto';
+import { Prisma } from '@prisma/client';
 import type {
   Mode,
   OrderStatus,
   StorePaymentMode,
   PaymentAttemptStatus,
   PaymentMethodKey,
-} from '@prisma/client'
-import { PrismaService } from '../../prisma/prisma.service'
-import { OutboxService } from '../../common/messaging/outbox.service'
-import { LedgerService } from '../../ledger/ledger.service'
-import { offlineCommitment } from '../../ledger/posting-rules'
-import { money, parseDecimal, toDecimalString } from '../../common/money/money.util'
-import type { Money } from '../../common/money/money.types'
-import { IdempotencyService } from '../../common/idempotency/idempotency.service'
+} from '@prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { OutboxService } from '../../common/messaging/outbox.service';
+import { LedgerService } from '../../ledger/ledger.service';
+import { offlineCommitment } from '../../ledger/posting-rules';
+import {
+  money,
+  parseDecimal,
+  toDecimalString,
+} from '../../common/money/money.util';
+import type { Money } from '../../common/money/money.types';
+import { IdempotencyService } from '../../common/idempotency/idempotency.service';
 import {
   IdReservationService,
   PAYMENT_INTENTS_TABLE,
-} from '../../common/ids/id-reservation.service'
-import { fingerprintRequest } from '../../common/idempotency/idempotency.types'
-import { PaymentAccountService } from '../payments/payment-account.service'
+} from '../../common/ids/id-reservation.service';
+import { fingerprintRequest } from '../../common/idempotency/idempotency.types';
+import { PaymentAccountService } from '../payments/payment-account.service';
 import {
   OfferingPolicyError,
   checkPolicy,
@@ -34,9 +38,9 @@ import {
   describePolicy,
   feeLabel,
   parseOfferingPolicy,
-} from './offering-policy'
-import { ProviderRegistry } from '../payments/gateways/provider-registry.service'
-import { PaymentFactApplier } from '../payments/facts/payment-fact.applier'
+} from './offering-policy';
+import { ProviderRegistry } from '../payments/gateways/provider-registry.service';
+import { PaymentFactApplier } from '../payments/facts/payment-fact.applier';
 import {
   ProviderError,
   buildFactDedupeKey,
@@ -47,14 +51,14 @@ import {
   type InitializeResult,
   type NextAction,
   type ObservedFact,
-} from '../payments/gateways/provider.types'
-import { CreateCheckoutDto } from './dto/create-checkout.dto'
+} from '../payments/gateways/provider.types';
+import { CreateCheckoutDto } from './dto/create-checkout.dto';
 
 /** How long a checkout, and the stock it holds, stays alive. */
-const CHECKOUT_TTL_MINUTES = 30
+const CHECKOUT_TTL_MINUTES = 30;
 
 /** Idempotency scope for storefront checkout. */
-const CHECKOUT_SCOPE = 'checkout.create'
+const CHECKOUT_SCOPE = 'checkout.create';
 
 /**
  * The provider's identifiers, where the result carries any.
@@ -68,31 +72,31 @@ function providerRefs(result: InitializeResult): GatewayRefs | undefined {
     case 'authorized':
     case 'succeeded':
     case 'pending':
-      return result.refs
+      return result.refs;
     default:
-      return undefined
+      return undefined;
   }
 }
 
 /** Account states a customer may pay against. Mirrors listPaymentMethods. */
-const USABLE_ACCOUNT_STATUSES: readonly string[] = ['active', 'verifying']
+const USABLE_ACCOUNT_STATUSES: readonly string[] = ['active', 'verifying'];
 
 interface ResolvedLine {
-  variantId: bigint
-  productId: bigint
-  title: string
-  variantTitle: string | null
-  imageUrl: string | null
-  unitPrice: Money
-  quantity: number
-  trackInventory: boolean
-  continueSelling: boolean
-  inventoryQty: number
+  variantId: bigint;
+  productId: bigint;
+  title: string;
+  variantTitle: string | null;
+  imageUrl: string | null;
+  unitPrice: Money;
+  quantity: number;
+  trackInventory: boolean;
+  continueSelling: boolean;
+  inventoryQty: number;
 }
 
 @Injectable()
 export class CheckoutService {
-  private readonly logger = new Logger(CheckoutService.name)
+  private readonly logger = new Logger(CheckoutService.name);
 
   constructor(
     private readonly prisma: PrismaService,
@@ -112,19 +116,25 @@ export class CheckoutService {
    * chosen position.
    */
   async listPaymentMethods(slug: string, mode: Mode = 'live') {
-    const store = await this.findStore(slug)
+    const store = await this.findStore(slug);
 
-    const offerings = await this.prisma.guarded().paymentMethodOffering.findMany({
-      where: { store_id: store.id, mode, enabled: true },
-      orderBy: { position: 'asc' },
-    })
+    const offerings = await this.prisma
+      .guarded()
+      .paymentMethodOffering.findMany({
+        where: { store_id: store.id, mode, enabled: true },
+        orderBy: { position: 'asc' },
+      });
 
-    if (offerings.length === 0) return []
+    if (offerings.length === 0) return [];
 
     const accounts = await this.prisma.guarded().paymentAccount.findMany({
-      where: { store_id: store.id, mode, status: { in: ['active', 'verifying'] } },
-    })
-    const byId = new Map(accounts.map((a) => [a.id.toString(), a]))
+      where: {
+        store_id: store.id,
+        mode,
+        status: { in: ['active', 'verifying'] },
+      },
+    });
+    const byId = new Map(accounts.map((a) => [a.id.toString(), a]));
 
     return offerings
       .filter((o) => byId.has(o.account_id.toString()))
@@ -140,7 +150,7 @@ export class CheckoutService {
         // commits to a method. A malformed policy is reported as null
         // rather than breaking the whole list.
         policy: this.safeDescribePolicy(o.constraints),
-      }))
+      }));
   }
 
   /**
@@ -160,7 +170,7 @@ export class CheckoutService {
     mode: Mode = 'live',
     idempotencyKey?: string,
   ) {
-    const store = await this.findStore(slug)
+    const store = await this.findStore(slug);
 
     // Without this, a double-tapped Place Order button produces two
     // orders, two ledger entries and two inventory decrements. The
@@ -168,7 +178,7 @@ export class CheckoutService {
     // context, and storefront routes have no ActiveStoreGuard, so the
     // store is only known after the slug is resolved.
     if (!idempotencyKey) {
-      return this.commit(store, dto, mode)
+      return this.commit(store, dto, mode);
     }
 
     const claim = await this.idempotency.claim({
@@ -183,31 +193,37 @@ export class CheckoutService {
       }),
       ttlSeconds: this.idempotency.defaultTtlSeconds,
       leaseSeconds: this.idempotency.defaultLeaseSeconds,
-    })
+    });
 
     if (claim.outcome === 'conflict') {
-      throw new ConflictException(claim.detail)
+      throw new ConflictException(claim.detail);
     }
 
     if (claim.outcome === 'in_flight') {
       throw new ConflictException(
         'This order is already being placed. Please wait a moment.',
-      )
+      );
     }
 
     if (claim.outcome === 'replay') {
-      return claim.body as Awaited<ReturnType<CheckoutService['commit']>>
+      return claim.body as Awaited<ReturnType<CheckoutService['commit']>>;
     }
 
     try {
-      const response = await this.commit(store, dto, mode)
-      await this.idempotency.complete(claim.recordId, store.id, 201, response)
-      return response
+      const response = await this.commit(store, dto, mode);
+      await this.idempotency.complete(
+        claim.recordId,
+        store.id,
+        mode,
+        201,
+        response,
+      );
+      return response;
     } catch (error) {
       await this.idempotency
-        .fail(claim.recordId, store.id)
-        .catch(() => undefined)
-      throw error
+        .fail(claim.recordId, store.id, mode)
+        .catch(() => undefined);
+      throw error;
     }
   }
 
@@ -217,31 +233,37 @@ export class CheckoutService {
     dto: CreateCheckoutDto,
     mode: Mode,
   ) {
-    const currency = (store.currency || 'USD').toUpperCase()
+    const currency = (store.currency || 'USD').toUpperCase();
 
-    const offering = await this.prisma.guarded().paymentMethodOffering.findFirst({
-      where: {
-        id: BigInt(dto.payment_offering_id),
-        store_id: store.id,
-        mode,
-        enabled: true,
-      },
-    })
+    const offering = await this.prisma
+      .guarded()
+      .paymentMethodOffering.findFirst({
+        where: {
+          id: BigInt(dto.payment_offering_id),
+          store_id: store.id,
+          mode,
+          enabled: true,
+        },
+      });
 
     if (!offering) {
-      throw new BadRequestException('Selected payment method is not available.')
+      throw new BadRequestException(
+        'Selected payment method is not available.',
+      );
     }
 
     // The gateway key lives on the account, and it selects the adapter.
     const account = await this.prisma.guarded().paymentAccount.findFirst({
       where: { id: offering.account_id, store_id: store.id, mode },
       select: { id: true, gateway: true, status: true },
-    })
+    });
 
     // Must match what listPaymentMethods advertises, or a customer could
     // commit against a draft or errored account by posting its offering id.
     if (!account || !USABLE_ACCOUNT_STATUSES.includes(account.status)) {
-      throw new BadRequestException('Selected payment method is not available.')
+      throw new BadRequestException(
+        'Selected payment method is not available.',
+      );
     }
 
     // No commitment-kind gate here any more. Whether a method can be
@@ -251,44 +273,47 @@ export class CheckoutService {
     // A hardcoded allow-list here silently made every gateway
     // unreachable no matter what was registered.
 
-    const lines = await this.resolveLines(store.id, currency, dto)
+    const lines = await this.resolveLines(store.id, currency, dto);
     const subtotalMinor = lines.reduce(
       (acc, l) => acc + l.unitPrice.amountMinor * BigInt(l.quantity),
       0n,
-    )
+    );
 
     if (subtotalMinor <= 0n) {
-      throw new BadRequestException('Cart total must be greater than zero.')
+      throw new BadRequestException('Cart total must be greater than zero.');
     }
 
     // Limits and fees the merchant configured on this method. Until now
     // the constraints column was written and never read.
-    const policy = this.readPolicy(offering.constraints)
+    const policy = this.readPolicy(offering.constraints);
 
     const violation = checkPolicy(policy, {
       subtotalMinor,
       currency,
       city: dto.city,
-    })
+    });
 
     if (violation) {
-      throw new BadRequestException(violation.message)
+      throw new BadRequestException(violation.message);
     }
 
-    const feeMinor = computeFeeMinor(policy, subtotalMinor)
-    const totalMinor = subtotalMinor + feeMinor
+    const feeMinor = computeFeeMinor(policy, subtotalMinor);
+    const totalMinor = subtotalMinor + feeMinor;
 
-    const now = new Date()
-    const expiresAt = new Date(now.getTime() + CHECKOUT_TTL_MINUTES * 60_000)
-    const beneficiaryId = await this.ensureStoreBeneficiary(store.id, mode, currency)
-
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + CHECKOUT_TTL_MINUTES * 60_000);
+    const beneficiaryId = await this.ensureStoreBeneficiary(
+      store.id,
+      mode,
+      currency,
+    );
 
     // The intent id is needed for the deterministic PSP idempotency key,
     // so the intent is created first, then the adapter is called, then the
     // rest of the commit runs. The adapter call stays outside the
     // transaction: never hold a database transaction open across network
     // I/O.
-    const intentId = await this.ids.reserve(PAYMENT_INTENTS_TABLE)
+    const intentId = await this.ids.reserve(PAYMENT_INTENTS_TABLE);
 
     const initializeResult = await this.initializePayment({
       storeId: store.id,
@@ -301,12 +326,12 @@ export class CheckoutService {
       intentId,
       amountMinor: totalMinor,
       currency,
-    })
+    });
 
     const { nextAction, attemptStatus, offline } =
-      this.interpretResult(initializeResult)
+      this.interpretResult(initializeResult);
 
-    const gatewayRefs = providerRefs(initializeResult)
+    const gatewayRefs = providerRefs(initializeResult);
 
     // Bank transfer produces an order that is explicitly not yet paid.
     // Cash on delivery is collected on handover, so it enters the normal
@@ -314,9 +339,9 @@ export class CheckoutService {
     const orderStatus: OrderStatus =
       offering.commitment_kind === 'awaiting_offline_settlement'
         ? 'AWAITING_PAYMENT'
-        : 'PENDING'
+        : 'PENDING';
 
-    const result = await this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.guarded().$transaction(async (tx) => {
       const checkout = await tx.checkout.create({
         data: {
           store_id: store.id,
@@ -337,7 +362,7 @@ export class CheckoutService {
           expires_at: expiresAt,
         },
         select: { id: true, token: true },
-      })
+      });
 
       await tx.checkoutLineItem.createMany({
         data: lines.map((l) => ({
@@ -350,7 +375,7 @@ export class CheckoutService {
           unit_price_minor: l.unitPrice.amountMinor,
           quantity: l.quantity,
         })),
-      })
+      });
 
       // Invariant: quote_total_minor equals the sum of its components.
       await tx.quoteComponent.create({
@@ -362,7 +387,7 @@ export class CheckoutService {
           source_ref: 'checkout.lines',
           position: 0,
         },
-      })
+      });
 
       if (feeMinor > 0n) {
         await tx.quoteComponent.create({
@@ -374,7 +399,7 @@ export class CheckoutService {
             source_ref: `offering:${offering.id}`,
             position: 1,
           },
-        })
+        });
       }
 
       // Reservations are recorded and immediately converted: this phase
@@ -395,7 +420,7 @@ export class CheckoutService {
             expires_at: expiresAt,
             settled_at: offline ? now : null,
           })),
-      })
+      });
 
       // Created here with the reserved id, so a checkout that fails
       // before this point leaves nothing behind.
@@ -420,9 +445,9 @@ export class CheckoutService {
           expires_at: expiresAt,
         },
         select: { id: true },
-      })
+      });
 
-      const storedPayload = nextActionPayload(nextAction)
+      const storedPayload = nextActionPayload(nextAction);
 
       await tx.paymentAttempt.create({
         data: {
@@ -451,16 +476,19 @@ export class CheckoutService {
             operation: 'initialize',
           }),
         },
-      })
+      });
 
       if (!offline) {
         // No order yet. It is created by the fact applier when the
         // provider confirms the money, which is what makes "an order
         // exists" mean "the money is secured".
-        return { checkout, order: null }
+        return { checkout, order: null };
       }
 
-      const orderNumber = await this.nextOrderNumber(tx, store.id)
+      const orderNumber = await this.nextOrderNumber(
+        tx as unknown as Prisma.TransactionClient,
+        store.id,
+      );
 
       const order = await tx.order.create({
         data: {
@@ -492,26 +520,34 @@ export class CheckoutService {
           },
         },
         select: { id: true, order_number: true },
-      })
+      });
 
       await tx.checkout.update({
-        where: { id: checkout.id },
-        data: { status: 'committed', committed_at: now, order_id: order.id },
-      })
+        where: {
+          id: checkout.id,
+          store_id: store.id,
+          mode,
+        },
+        data: {
+          status: 'committed',
+          committed_at: now,
+          order_id: order.id,
+        },
+      });
 
       for (const line of lines) {
-        if (!line.trackInventory) continue
+        if (!line.trackInventory) continue;
         await tx.productVariant.update({
           where: { id: line.variantId },
           data: { inventory_qty: { decrement: line.quantity } },
-        })
+        });
       }
 
       // Revenue is recognised at offline commitment; the matching
       // receivable clears when the merchant records collection. For a
       // gateway the ledger entry is posted by the applier when the money
       // is actually captured, so nothing is posted here.
-      await this.ledger.post(tx, {
+      await this.ledger.post(tx as unknown as Prisma.TransactionClient, {
         storeId: store.id,
         mode,
         currency,
@@ -525,9 +561,9 @@ export class CheckoutService {
           totalMinor,
           allocations: [{ beneficiaryId, amountMinor: totalMinor }],
         }),
-      })
+      });
 
-      await this.outbox.emit(tx, {
+      await this.outbox.emit(tx as unknown as Prisma.TransactionClient, {
         storeId: store.id,
         mode,
         aggregateType: 'checkout',
@@ -543,10 +579,10 @@ export class CheckoutService {
           commitmentKind: offering.commitment_kind,
         },
         occurredAt: now,
-      })
+      });
 
-      return { checkout, order }
-    })
+      return { checkout, order };
+    });
 
     // The adapter may have authorised or captured in the same call. That
     // outcome becomes a fact and goes through the applier, so the order
@@ -556,10 +592,10 @@ export class CheckoutService {
         initializeResult,
         offering.account_id,
         currency,
-      )
+      );
 
       if (fact) {
-        await this.applier.applyMany([fact], 'api')
+        await this.applier.applyMany([fact], 'api');
       }
     }
 
@@ -581,12 +617,12 @@ export class CheckoutService {
             status: true,
             payment_status: true,
           },
-        })
+        });
 
     this.logger.log(
       `Checkout ${result.checkout.id} committed for store ${store.id} ` +
         `(${offering.commitment_kind}${order ? `, order ${order.order_number}` : ', awaiting payment'})`,
-    )
+    );
 
     return {
       // Null while the customer still has an action to complete. The
@@ -607,10 +643,10 @@ export class CheckoutService {
       payment_redirect_url:
         nextAction.kind === 'redirect' ? nextAction.url : null,
       next_action: (() => {
-        const payload = nextActionPayload(nextAction)
-        return payload ? { kind: nextAction.kind, ...payload } : null
+        const payload = nextActionPayload(nextAction);
+        return payload ? { kind: nextAction.kind, ...payload } : null;
       })(),
-    }
+    };
   }
 
   /**
@@ -620,13 +656,13 @@ export class CheckoutService {
    * the order record, they live on the attempt.
    */
   async getCheckoutStatus(slug: string, token: string) {
-    const store = await this.findStore(slug)
+    const store = await this.findStore(slug);
 
     const checkout = await this.prisma.guarded().checkout.findFirst({
       where: { store_id: store.id, token },
-    })
+    });
 
-    if (!checkout) throw new NotFoundException('Checkout not found.')
+    if (!checkout) throw new NotFoundException('Checkout not found.');
 
     const intent = await this.prisma.guarded().paymentIntent.findFirst({
       where: {
@@ -636,15 +672,19 @@ export class CheckoutService {
         context_id: checkout.id.toString(),
       },
       select: { id: true, status: true },
-    })
+    });
 
     const attempt = intent
       ? await this.prisma.guarded().paymentAttempt.findFirst({
-          where: { intent_id: intent.id, store_id: store.id, mode: checkout.mode },
+          where: {
+            intent_id: intent.id,
+            store_id: store.id,
+            mode: checkout.mode,
+          },
           orderBy: { sequence: 'desc' },
           select: { next_action_kind: true, next_action_payload: true },
         })
-      : null
+      : null;
 
     const order = checkout.order_id
       ? await this.prisma.guarded().order.findFirst({
@@ -657,7 +697,7 @@ export class CheckoutService {
             total: true,
           },
         })
-      : null
+      : null;
 
     return {
       checkout_token: checkout.token,
@@ -668,7 +708,10 @@ export class CheckoutService {
         attempt && attempt.next_action_kind !== 'none'
           ? {
               kind: attempt.next_action_kind,
-              ...((attempt.next_action_payload ?? {}) as Record<string, unknown>),
+              ...((attempt.next_action_payload ?? {}) as Record<
+                string,
+                unknown
+              >),
             }
           : null,
       order: order
@@ -680,7 +723,7 @@ export class CheckoutService {
             total: String(order.total),
           }
         : null,
-    }
+    };
   }
 
   /**
@@ -695,14 +738,14 @@ export class CheckoutService {
    * status the webhook already applied is recognised as a duplicate.
    */
   async syncCheckoutStatus(slug: string, token: string) {
-    const store = await this.findStore(slug)
+    const store = await this.findStore(slug);
 
     const checkout = await this.prisma.guarded().checkout.findFirst({
       where: { store_id: store.id, token },
       select: { id: true, mode: true },
-    })
+    });
 
-    if (!checkout) throw new NotFoundException('Checkout not found.')
+    if (!checkout) throw new NotFoundException('Checkout not found.');
 
     const intent = await this.prisma.guarded().paymentIntent.findFirst({
       where: {
@@ -712,7 +755,7 @@ export class CheckoutService {
         context_id: checkout.id.toString(),
       },
       select: { id: true, account_id: true },
-    })
+    });
 
     if (intent?.account_id) {
       await this.pullProviderStatus(
@@ -720,10 +763,10 @@ export class CheckoutService {
         checkout.mode,
         intent.id,
         intent.account_id,
-      )
+      );
     }
 
-    return this.getCheckoutStatus(slug, token)
+    return this.getCheckoutStatus(slug, token);
   }
 
   /**
@@ -743,41 +786,41 @@ export class CheckoutService {
       const account = await this.prisma.guarded().paymentAccount.findFirst({
         where: { id: accountId, store_id: storeId, mode },
         select: { id: true, gateway: true },
-      })
+      });
 
-      if (!account || !this.providers.has(account.gateway)) return
+      if (!account || !this.providers.has(account.gateway)) return;
 
-      const provider = this.providers.get(account.gateway)
-      if (!provider.capabilities.statusPolling) return
+      const provider = this.providers.get(account.gateway);
+      if (!provider.capabilities.statusPolling) return;
 
       const attempt = await this.prisma.guarded().paymentAttempt.findFirst({
         where: { intent_id: intentId, store_id: storeId, mode },
         orderBy: { sequence: 'desc' },
         select: { gateway_reference: true },
-      })
+      });
 
-      if (!attempt?.gateway_reference) return
+      if (!attempt?.gateway_reference) return;
 
       const credentials = await this.accounts.revealCredentialsForGateway(
         storeId,
         mode,
         account.id,
-      )
+      );
 
       const facts = await provider.fetchStatus({
         accountId: account.id,
         gatewayReference: attempt.gateway_reference,
         credentials,
         mode,
-      })
+      });
 
       if (facts.length > 0) {
-        await this.applier.applyMany(facts, 'return_url')
+        await this.applier.applyMany(facts, 'return_url');
       }
     } catch (error) {
       this.logger.warn(
         `Status sync failed for intent ${intentId}: ${(error as Error).message}`,
-      )
+      );
     }
   }
 
@@ -790,35 +833,35 @@ export class CheckoutService {
    * adapter and in the shape of the result it returns.
    */
   private async initializePayment(input: {
-    storeId: bigint
-    mode: Mode
-    accountId: bigint
-    gateway: string
-    offeringId: bigint
-    method: PaymentMethodKey
-    gatewayMethodConfig: string
-    intentId: bigint
-    amountMinor: bigint
-    currency: string
+    storeId: bigint;
+    mode: Mode;
+    accountId: bigint;
+    gateway: string;
+    offeringId: bigint;
+    method: PaymentMethodKey;
+    gatewayMethodConfig: string;
+    intentId: bigint;
+    amountMinor: bigint;
+    currency: string;
   }): Promise<InitializeResult> {
-    let provider
+    let provider;
 
     try {
       provider = this.providers.assertCanHandle({
         gateway: input.gateway,
         method: input.method,
         currency: input.currency,
-      })
+      });
     } catch (error) {
       if (error instanceof ProviderError) {
         this.logger.error(
           `Adapter cannot handle this request (${error.code}): ${error.message}`,
-        )
+        );
         throw new BadRequestException(
           'Selected payment method is not available.',
-        )
+        );
       }
-      throw error
+      throw error;
     }
 
     // Credentials are decrypted here and handed to the adapter. Adapters
@@ -828,7 +871,7 @@ export class CheckoutService {
       input.storeId,
       input.mode,
       input.accountId,
-    )
+    );
 
     try {
       return await provider.initializePayment({
@@ -844,21 +887,21 @@ export class CheckoutService {
         amountMinor: input.amountMinor,
         currency: input.currency,
         credentials,
-      })
+      });
     } catch (error) {
       // A ProviderError is a domain outcome, not a server fault. Letting
       // it escape would turn a misconfigured payment method into a 500.
       if (error instanceof ProviderError) {
         this.logger.error(
           `Adapter "${input.gateway}" refused to initialise (${error.code}): ${error.message}`,
-        )
+        );
         throw new BadRequestException(
           error.code === 'configuration_error'
             ? 'This payment method is not configured. Please choose another.'
             : 'Payment could not be started. Please choose another method.',
-        )
+        );
       }
-      throw error
+      throw error;
     }
   }
 
@@ -872,10 +915,10 @@ export class CheckoutService {
    * against a payment that was never taken.
    */
   private interpretResult(result: InitializeResult): {
-    nextAction: NextAction
-    attemptStatus: PaymentAttemptStatus
+    nextAction: NextAction;
+    attemptStatus: PaymentAttemptStatus;
     /** True when the merchant accepted an unfunded promise. */
-    offline: boolean
+    offline: boolean;
   } {
     switch (result.kind) {
       case 'no_gateway':
@@ -883,32 +926,43 @@ export class CheckoutService {
           nextAction: result.nextAction ?? { kind: 'none' },
           attemptStatus: 'requires_action',
           offline: true,
-        }
+        };
 
       case 'requires_action':
         return {
           nextAction: result.nextAction,
           attemptStatus: 'requires_action',
           offline: false,
-        }
+        };
 
       case 'pending':
         return {
-          nextAction: { kind: 'poll', pollAfterSeconds: result.pollAfterSeconds },
+          nextAction: {
+            kind: 'poll',
+            pollAfterSeconds: result.pollAfterSeconds,
+          },
           attemptStatus: 'processing',
           offline: false,
-        }
+        };
 
       case 'authorized':
-        return { nextAction: { kind: 'none' }, attemptStatus: 'authorized', offline: false }
+        return {
+          nextAction: { kind: 'none' },
+          attemptStatus: 'authorized',
+          offline: false,
+        };
 
       case 'succeeded':
-        return { nextAction: { kind: 'none' }, attemptStatus: 'succeeded', offline: false }
+        return {
+          nextAction: { kind: 'none' },
+          attemptStatus: 'succeeded',
+          offline: false,
+        };
 
       case 'failed':
         throw new BadRequestException(
           `Payment could not be started (${result.errorCode}).`,
-        )
+        );
     }
   }
 
@@ -926,18 +980,19 @@ export class CheckoutService {
     accountId: bigint,
     currency: string,
   ): ObservedFact | null {
-    if (result.kind !== 'authorized' && result.kind !== 'succeeded') return null
+    if (result.kind !== 'authorized' && result.kind !== 'succeeded')
+      return null;
 
-    const reference = result.refs?.gatewayReference
-    if (!reference) return null
+    const reference = result.refs?.gatewayReference;
+    if (!reference) return null;
 
     const factType =
-      result.kind === 'succeeded' ? 'attempt_captured' : 'attempt_authorized'
+      result.kind === 'succeeded' ? 'attempt_captured' : 'attempt_authorized';
 
     const cumulativeAmountMinor =
       result.kind === 'succeeded'
         ? result.capturedAmountMinor
-        : result.authorizedAmountMinor
+        : result.authorizedAmountMinor;
 
     return {
       dedupeKey: buildFactDedupeKey({
@@ -953,7 +1008,7 @@ export class CheckoutService {
       cumulativeAmountMinor,
       currency: currency.toUpperCase(),
       refs: result.refs,
-    }
+    };
   }
 
   /* ---------------------------------------------------------------- */
@@ -967,33 +1022,35 @@ export class CheckoutService {
    */
   private readPolicy(raw: unknown) {
     try {
-      return parseOfferingPolicy(raw)
+      return parseOfferingPolicy(raw);
     } catch (error) {
       if (error instanceof OfferingPolicyError) {
         this.logger.error(
           `Malformed payment method constraints: ${error.message}`,
-        )
+        );
         throw new BadRequestException(
           'This payment method is misconfigured. Please choose another.',
-        )
+        );
       }
-      throw error
+      throw error;
     }
   }
 
   /** Policy for display. Never throws: one bad row must not hide the rest. */
   private safeDescribePolicy(raw: unknown) {
     try {
-      return describePolicy(parseOfferingPolicy(raw))
+      return describePolicy(parseOfferingPolicy(raw));
     } catch {
-      return null
+      return null;
     }
   }
 
   private async findStore(slug: string) {
-    const store = await this.prisma.guarded().store.findFirst({ where: { slug } })
-    if (!store) throw new NotFoundException('Store not found.')
-    return store
+    const store = await this.prisma
+      .guarded()
+      .store.findFirst({ where: { slug } });
+    if (!store) throw new NotFoundException('Store not found.');
+    return store;
   }
 
   /**
@@ -1005,25 +1062,27 @@ export class CheckoutService {
     currency: string,
     dto: CreateCheckoutDto,
   ): Promise<ResolvedLine[]> {
-    const ids = dto.items.map((i) => BigInt(i.variant_id))
+    const ids = dto.items.map((i) => BigInt(i.variant_id));
 
     const variants = await this.prisma.guarded().productVariant.findMany({
       where: { id: { in: ids }, product: { store_id: storeId } },
       include: { product: true },
-    })
+    });
 
-    const byId = new Map(variants.map((v: any) => [v.id.toString(), v]))
-    const lines: ResolvedLine[] = []
+    const byId = new Map(variants.map((v: any) => [v.id.toString(), v]));
+    const lines: ResolvedLine[] = [];
 
     for (const item of dto.items) {
-      const variant: any = byId.get(item.variant_id)
+      const variant: any = byId.get(item.variant_id);
 
       if (!variant) {
-        throw new BadRequestException(`Product variant ${item.variant_id} is unavailable.`)
+        throw new BadRequestException(
+          `Product variant ${item.variant_id} is unavailable.`,
+        );
       }
 
-      const priceRaw = variant.price === null ? '0' : String(variant.price)
-      const unitPrice = parseDecimal(priceRaw, currency)
+      const priceRaw = variant.price === null ? '0' : String(variant.price);
+      const unitPrice = parseDecimal(priceRaw, currency);
 
       if (
         variant.track_inventory &&
@@ -1032,7 +1091,7 @@ export class CheckoutService {
       ) {
         throw new BadRequestException(
           `Not enough stock for "${variant.product.title}".`,
-        )
+        );
       }
 
       lines.push({
@@ -1046,10 +1105,10 @@ export class CheckoutService {
         trackInventory: variant.track_inventory,
         continueSelling: variant.continue_selling,
         inventoryQty: variant.inventory_qty,
-      })
+      });
     }
 
-    return lines
+    return lines;
   }
 
   /** Store-scoped beneficiary, created on first use. */
@@ -1061,9 +1120,9 @@ export class CheckoutService {
     const existing = await this.prisma.guarded().beneficiary.findFirst({
       where: { store_id: storeId, mode, kind: 'store', external_ref: null },
       select: { id: true },
-    })
+    });
 
-    if (existing) return existing.id
+    if (existing) return existing.id;
 
     const created = await this.prisma.guarded().beneficiary.create({
       data: {
@@ -1074,9 +1133,9 @@ export class CheckoutService {
         default_currency: currency,
       },
       select: { id: true },
-    })
+    });
 
-    return created.id
+    return created.id;
   }
 
   /**
@@ -1102,16 +1161,16 @@ export class CheckoutService {
     tx: Prisma.TransactionClient,
     storeId: bigint,
   ): Promise<string> {
-    await tx.$executeRaw`SELECT id FROM store WHERE id = ${storeId} FOR UPDATE`
+    await tx.$executeRaw`SELECT id FROM store WHERE id = ${storeId} FOR UPDATE`;
 
     const highest = await tx.order.findFirst({
       where: { store_id: storeId },
       orderBy: { id: 'desc' },
       select: { order_number: true },
-    })
+    });
 
-    const previous = highest ? Number.parseInt(highest.order_number, 10) : NaN
+    const previous = highest ? Number.parseInt(highest.order_number, 10) : NaN;
 
-    return String(Number.isFinite(previous) ? previous + 1 : 1001)
+    return String(Number.isFinite(previous) ? previous + 1 : 1001);
   }
 }

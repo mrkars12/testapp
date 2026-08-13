@@ -1,11 +1,26 @@
 // src/uploads/uploads.service.ts
-import { Injectable, BadRequestException, UnauthorizedException } from '@nestjs/common';
-import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import {
+  Injectable,
+  BadRequestException,
+  UnauthorizedException,
+} from '@nestjs/common';
+import {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+} from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 
-const ALLOWED_MIME = ['image/png', 'image/jpeg','image/webp', 'image/jpg', 'video/mp4'];
+const ALLOWED_MIME = [
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/jpg',
+  'video/mp4',
+];
+
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
 
@@ -42,20 +57,39 @@ export class UploadsService {
    * way here so uploads always target the right store instead of crashing
    * before ever reaching R2.
    */
-  private async resolveStoreId(userId: string | number | bigint): Promise<bigint> {
+  private async resolveStoreId(
+    userId: string | number | bigint,
+  ): Promise<bigint> {
     const store = await this.prisma.store.findFirst({
       where: { ownerId: BigInt(userId) },
     });
-    if (!store) throw new UnauthorizedException('لا يوجد متجر مرتبط بهذا الحساب');
+
+    if (!store) {
+      throw new UnauthorizedException('لا يوجد متجر مرتبط بهذا الحساب');
+    }
+
     return store.id;
   }
 
-  async presignForUser(userId: string | number | bigint, body: { fileName: string; mimeType: string; size: number; folder: 'products' | 'variants' }) {
+  async presignForUser(
+    userId: string | number | bigint,
+    body: {
+      fileName: string;
+      mimeType: string;
+      size: number;
+      folder: 'products' | 'variants';
+    },
+  ) {
     const storeId = await this.resolveStoreId(userId);
     return this.presign(storeId, body);
   }
 
-  async confirmForUser(userId: string | number | bigint, key: string, attachedType?: string, attachedId?: string) {
+  async confirmForUser(
+    userId: string | number | bigint,
+    key: string,
+    attachedType?: string,
+    attachedId?: string,
+  ) {
     const storeId = await this.resolveStoreId(userId);
     return this.confirm(storeId, key, attachedType, attachedId);
   }
@@ -65,17 +99,32 @@ export class UploadsService {
     return this.remove(storeId, key);
   }
 
-  async presign(storeId: bigint, body: { fileName: string; mimeType: string; size: number; folder: 'products' | 'variants' }) {
+  async presign(
+    storeId: bigint,
+    body: {
+      fileName: string;
+      mimeType: string;
+      size: number;
+      folder: 'products' | 'variants';
+    },
+  ) {
     if (!ALLOWED_MIME.includes(body.mimeType)) {
-      throw new BadRequestException('نوع الملف غير مسموح به. المسموح: png, jpg, mp4');
+      throw new BadRequestException(
+        'نوع الملف غير مسموح به. المسموح: png, jpg, mp4',
+      );
     }
+
     const isVideo = body.mimeType === 'video/mp4';
     const maxSize = isVideo ? MAX_VIDEO_SIZE : MAX_IMAGE_SIZE;
+
     if (body.size > maxSize) {
-      throw new BadRequestException(`حجم الملف أكبر من المسموح (${isVideo ? '50' : '10'} ميجا)`);
+      throw new BadRequestException(
+        `حجم الملف أكبر من المسموح (${isVideo ? '50' : '10'} ميجا)`,
+      );
     }
 
     const ext = (body.fileName.split('.').pop() || 'jpg').toLowerCase();
+
     const key = `${storeId}/${body.folder}/${randomUUID()}.${ext}`;
     const publicUrl = `${process.env.R2_PUBLIC_URL}/${key}`;
 
@@ -84,9 +133,12 @@ export class UploadsService {
       Key: key,
       ContentType: body.mimeType,
     });
-    const uploadUrl = await getSignedUrl(this.client, command, { expiresIn: 300 });
 
-    await this.prisma.upload.create({
+    const uploadUrl = await getSignedUrl(this.client, command, {
+      expiresIn: 300,
+    });
+
+    await this.prisma.guarded().upload.create({
       data: {
         key,
         url: publicUrl,
@@ -97,32 +149,79 @@ export class UploadsService {
       },
     });
 
-    return { uploadUrl, key, publicUrl };
+    return {
+      uploadUrl,
+      key,
+      publicUrl,
+    };
   }
 
-  async confirm(storeId: bigint, key: string, attachedType?: string, attachedId?: string) {
-    const upload = await this.prisma.upload.findUnique({ where: { key } });
-    if (!upload || upload.store_id !== storeId) {
+  async confirm(
+    storeId: bigint,
+    key: string,
+    attachedType?: string,
+    attachedId?: string,
+  ) {
+    const upload = await this.prisma.guarded().upload.findFirst({
+      where: {
+        key,
+        store_id: storeId,
+      },
+    });
+
+    if (!upload) {
       throw new UnauthorizedException('ملف غير موجود أو غير مصرح به');
     }
-    await this.prisma.upload.update({
-      where: { key },
+
+    const result = await this.prisma.guarded().upload.updateMany({
+      where: {
+        key,
+        store_id: storeId,
+      },
       data: {
         status: 'attached',
         attached_type: attachedType,
         attached_id: attachedId ? BigInt(attachedId) : null,
       },
     });
+
+    if (result.count !== 1) {
+      throw new UnauthorizedException('ملف غير موجود أو غير مصرح به');
+    }
+
     return { success: true };
   }
 
   async remove(storeId: bigint, key: string) {
-    const upload = await this.prisma.upload.findUnique({ where: { key } });
-    if (!upload || upload.store_id !== storeId) {
+    const upload = await this.prisma.guarded().upload.findFirst({
+      where: {
+        key,
+        store_id: storeId,
+      },
+    });
+
+    if (!upload) {
       throw new UnauthorizedException('غير مصرح لك بحذف هذا الملف');
     }
-    await this.client.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: key }));
-    await this.prisma.upload.delete({ where: { key } });
+
+    await this.client.send(
+      new DeleteObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: key,
+      }),
+    );
+
+    const result = await this.prisma.guarded().upload.deleteMany({
+      where: {
+        key,
+        store_id: storeId,
+      },
+    });
+
+    if (result.count !== 1) {
+      throw new UnauthorizedException('غير مصرح لك بحذف هذا الملف');
+    }
+
     return { success: true };
   }
 

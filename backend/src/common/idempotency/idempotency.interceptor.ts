@@ -7,20 +7,20 @@ import {
   NestInterceptor,
   ServiceUnavailableException,
   SetMetadata,
-} from '@nestjs/common'
-import { Reflector } from '@nestjs/core'
-import { Observable, from, of } from 'rxjs'
-import { catchError, switchMap, tap } from 'rxjs/operators'
-import type { Request, Response } from 'express'
-import { TenantContextService } from '../tenant/tenant-context.service'
-import { IdempotencyService } from './idempotency.service'
+} from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import { Observable, from, of } from 'rxjs';
+import { catchError, switchMap, tap } from 'rxjs/operators';
+import type { Request, Response } from 'express';
+import { TenantContextService } from '../tenant/tenant-context.service';
+import { IdempotencyService } from './idempotency.service';
 import {
   IDEMPOTENCY_HEADER,
   IDEMPOTENCY_METADATA,
   IdempotencyOptions,
   fingerprintRequest,
   validateIdempotencyKey,
-} from './idempotency.types'
+} from './idempotency.types';
 
 /**
  * بيعلّم راوت إنه محمي بمنع التكرار.
@@ -34,7 +34,7 @@ import {
  *   createIntent(...) {}
  */
 export const Idempotent = (options: IdempotencyOptions) =>
-  SetMetadata(IDEMPOTENCY_METADATA, options)
+  SetMetadata(IDEMPOTENCY_METADATA, options);
 
 /**
  * ══════════════════════════════════════════════════════════════════
@@ -65,41 +65,42 @@ export class IdempotencyInterceptor implements NestInterceptor {
     const options = this.reflector.get<IdempotencyOptions | undefined>(
       IDEMPOTENCY_METADATA,
       context.getHandler(),
-    )
+    );
 
-    if (!options) return next.handle()
+    if (!options) return next.handle();
 
-    const request = context.switchToHttp().getRequest<Request>()
-    const rawKey = request.headers[IDEMPOTENCY_HEADER]
+    const request = context.switchToHttp().getRequest<Request>();
+    const rawKey = request.headers[IDEMPOTENCY_HEADER];
 
     // المفتاح اختياري: الراوت شغال عادي من غيره، بس من غير حماية
-    if (rawKey === undefined) return next.handle()
+    if (rawKey === undefined) return next.handle();
 
-    let idempotencyKey: string
+    let idempotencyKey: string;
+
     try {
-      idempotencyKey = validateIdempotencyKey(rawKey)
+      idempotencyKey = validateIdempotencyKey(rawKey);
     } catch (error) {
-      throw new BadRequestException((error as Error).message)
+      throw new BadRequestException((error as Error).message);
     }
 
-    const storeIdRaw = this.tenantContext.getStoreId()
+    const storeIdRaw = this.tenantContext.getStoreId();
 
     if (storeIdRaw === null) {
       // في المرحلة 1a مفيش حل للمتجر النشط. الراوت اللي بيستخدم الديكوريتر
       // ده لازم يكون وراه ActiveStoreGuard (المرحلة 1b).
       throw new ServiceUnavailableException(
         'منع التكرار محتاج سياق متجر — تأكد إن الراوت وراه ActiveStoreGuard.',
-      )
+      );
     }
 
-    const storeId = BigInt(storeIdRaw)
-    const mode = this.tenantContext.getMode()
+    const storeId = BigInt(storeIdRaw);
+    const mode = this.tenantContext.getMode();
 
     const fingerprint = fingerprintRequest({
       method: request.method,
       path: request.route?.path ?? request.path,
       body: request.body,
-    })
+    });
 
     return from(
       this.idempotency.claim({
@@ -114,45 +115,53 @@ export class IdempotencyInterceptor implements NestInterceptor {
     ).pipe(
       switchMap((claim) => {
         if (claim.outcome === 'conflict') {
-          throw new ConflictException(claim.detail)
+          throw new ConflictException(claim.detail);
         }
 
         if (claim.outcome === 'in_flight') {
-          const response = context.switchToHttp().getResponse<Response>()
-          response.setHeader('Retry-After', String(claim.retryAfterSeconds))
+          const response = context.switchToHttp().getResponse<Response>();
+
+          response.setHeader('Retry-After', String(claim.retryAfterSeconds));
+
           throw new ConflictException(
             'نفس الطلب لسه بيتنفّذ. استنى شوية وحاول تاني.',
-          )
+          );
         }
 
         if (claim.outcome === 'replay') {
-          const response = context.switchToHttp().getResponse<Response>()
-          response.status(claim.statusCode)
-          response.setHeader('Idempotent-Replayed', 'true')
-          return of(claim.body)
+          const response = context.switchToHttp().getResponse<Response>();
+
+          response.status(claim.statusCode);
+          response.setHeader('Idempotent-Replayed', 'true');
+
+          return of(claim.body);
         }
 
-        const recordId = claim.recordId
+        const recordId = claim.recordId;
 
         return next.handle().pipe(
           tap({
             next: (body) => {
-              const response = context.switchToHttp().getResponse<Response>()
-              const statusCode = response.statusCode ?? 200
-              const stored = options.redact ? options.redact(body) : body
+              const response = context.switchToHttp().getResponse<Response>();
+
+              const statusCode = response.statusCode ?? 200;
+              const stored = options.redact ? options.redact(body) : body;
 
               // مش بننتظر التخزين: فشله مايمنعش رد ناجح من الوصول للعميل
               void this.idempotency
-                .complete(recordId, storeId, statusCode, stored)
-                .catch(() => undefined)
+                .complete(recordId, storeId, mode, statusCode, stored)
+                .catch(() => undefined);
             },
           }),
           catchError((error) => {
-            void this.idempotency.fail(recordId, storeId).catch(() => undefined)
-            throw error
+            void this.idempotency
+              .fail(recordId, storeId, mode)
+              .catch(() => undefined);
+
+            throw error;
           }),
-        )
+        );
       }),
-    )
+    );
   }
 }

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "muse": {
+      "npm": "@ai-sdk/openai",
+      "name": "Muse",
+      "options": {
+        "baseURL": "https://api.meta.ai/v1"
+      },
+      "models": {
+        "muse-spark-1.2-contributor": {
+          "name": "Muse Spark 1.2 Contributor"
+        }
+      }
+    }
+  }
+}

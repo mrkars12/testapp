@@ -1,24 +1,24 @@
-import { Injectable, Logger } from '@nestjs/common'
-import { Prisma } from '@prisma/client'
-import type { Mode, OrderStatus, PaymentStatus } from '@prisma/client'
-import { PrismaService } from '../../../prisma/prisma.service'
-import { OutboxService } from '../../../common/messaging/outbox.service'
-import { money, toDecimalString } from '../../../common/money/money.util'
+import { Injectable, Logger } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import type { Mode, OrderStatus, PaymentStatus } from '@prisma/client';
+import { PrismaService } from '../../../prisma/prisma.service';
+import { OutboxService } from '../../../common/messaging/outbox.service';
+import { money, toDecimalString } from '../../../common/money/money.util';
 
 /** Shapes read off the loaded checkout. */
 interface CheckoutLine {
-  product_id: bigint | null
-  variant_id: bigint | null
-  title: string
-  variant_title: string | null
-  image_url: string | null
-  unit_price_minor: bigint
-  quantity: number
+  product_id: bigint | null;
+  variant_id: bigint | null;
+  title: string;
+  variant_title: string | null;
+  image_url: string | null;
+  unit_price_minor: bigint;
+  quantity: number;
 }
 
 interface QuoteLine {
-  kind: string
-  amount_minor: bigint
+  kind: string;
+  amount_minor: bigint;
 }
 
 /**
@@ -46,7 +46,7 @@ interface QuoteLine {
  */
 @Injectable()
 export class CheckoutFinalizerService {
-  private readonly logger = new Logger(CheckoutFinalizerService.name)
+  private readonly logger = new Logger(CheckoutFinalizerService.name);
 
   constructor(
     private readonly prisma: PrismaService,
@@ -64,36 +64,52 @@ export class CheckoutFinalizerService {
   async finalize(
     tx: Prisma.TransactionClient,
     input: {
-      checkoutId: bigint
-      storeId: bigint
-      mode: Mode
-      paid: boolean
-      occurredAt: Date
+      checkoutId: bigint;
+      storeId: bigint;
+      mode: Mode;
+      paid: boolean;
+      occurredAt: Date;
     },
   ): Promise<bigint | null> {
     const checkout = await tx.checkout.findFirst({
-      where: { id: input.checkoutId, store_id: input.storeId },
-      include: { items: true, components: true },
-    })
+      where: {
+        id: input.checkoutId,
+        store_id: input.storeId,
+        mode: input.mode,
+      },
+      include: {
+        items: true,
+        components: true,
+      },
+    });
 
-    if (!checkout) return null
+    if (!checkout) {
+      return null;
+    }
 
     // Already finalised by another route.
-    if (checkout.order_id !== null) return checkout.order_id
+    if (checkout.order_id !== null) {
+      return checkout.order_id;
+    }
 
-    const orderNumber = await this.nextOrderNumber(tx, input.storeId)
-    const currency = checkout.currency
+    const orderNumber = await this.nextOrderNumber(tx, input.storeId);
 
-    const components = checkout.components as QuoteLine[]
-    const items = checkout.items as CheckoutLine[]
+    const currency = checkout.currency;
+
+    const components = checkout.components as QuoteLine[];
+
+    const items = checkout.items as CheckoutLine[];
 
     const subtotalMinor = components
       .filter((component) => component.kind === 'line_subtotal')
-      .reduce((acc: bigint, component) => acc + component.amount_minor, 0n)
+      .reduce((acc: bigint, component) => acc + component.amount_minor, 0n);
 
-    const totalMinor = checkout.quote_total_minor
+    const totalMinor = checkout.quote_total_minor;
 
-    const shipping = (checkout.shipping_address ?? {}) as Record<string, unknown>
+    const shipping = (checkout.shipping_address ?? {}) as Record<
+      string,
+      unknown
+    >;
 
     const order = await tx.order.create({
       data: {
@@ -108,9 +124,10 @@ export class CheckoutFinalizerService {
         customer_email: checkout.customer_email,
         address_line: String(shipping.address_line ?? ''),
         city: String(shipping.city ?? ''),
-        notes: shipping.notes === null || shipping.notes === undefined
-          ? null
-          : String(shipping.notes),
+        notes:
+          shipping.notes === null || shipping.notes === undefined
+            ? null
+            : String(shipping.notes),
         paid_at: input.paid ? input.occurredAt : null,
         subtotal: toDecimalString(money(subtotalMinor, currency)),
         total: toDecimalString(money(totalMinor, currency)),
@@ -126,40 +143,62 @@ export class CheckoutFinalizerService {
           })),
         },
       },
-      select: { id: true, order_number: true },
-    })
+      select: {
+        id: true,
+        order_number: true,
+      },
+    });
 
     await tx.checkout.update({
-      where: { id: checkout.id },
+      where: {
+        id: checkout.id,
+        store_id: input.storeId,
+        mode: input.mode,
+      },
       data: {
         status: 'committed',
         committed_at: input.occurredAt,
         order_id: order.id,
       },
-    })
+    });
 
     // Stock was held at checkout, not taken. It is taken now.
     const reservations = await tx.inventoryReservation.findMany({
       where: {
         checkout_id: checkout.id,
         store_id: input.storeId,
+        mode: input.mode,
         state: 'held',
       },
-    })
+    });
 
     for (const reservation of reservations) {
       await tx.productVariant.update({
-        where: { id: reservation.variant_id },
-        data: { inventory_qty: { decrement: reservation.quantity } },
-      })
+        where: {
+          id: reservation.variant_id,
+        },
+        data: {
+          inventory_qty: {
+            decrement: reservation.quantity,
+          },
+        },
+      });
     }
 
     await tx.inventoryReservation.updateMany({
-      where: { checkout_id: checkout.id, store_id: input.storeId, state: 'held' },
-      data: { state: 'converted', settled_at: input.occurredAt },
-    })
+      where: {
+        checkout_id: checkout.id,
+        store_id: input.storeId,
+        mode: input.mode,
+        state: 'held',
+      },
+      data: {
+        state: 'converted',
+        settled_at: input.occurredAt,
+      },
+    });
 
-    await this.outbox.emit(tx, {
+    await this.outbox.emit(tx as unknown as Prisma.TransactionClient, {
       storeId: input.storeId,
       mode: input.mode,
       aggregateType: 'checkout',
@@ -174,13 +213,13 @@ export class CheckoutFinalizerService {
         commitmentKind: 'funds_secured',
       },
       occurredAt: input.occurredAt,
-    })
+    });
 
     this.logger.log(
       `Finalised checkout ${checkout.id} into order ${order.order_number} (${reservations.length} lines taken).`,
-    )
+    );
 
-    return order.id
+    return order.id;
   }
 
   /**
@@ -191,33 +230,66 @@ export class CheckoutFinalizerService {
    */
   async abandon(
     tx: Prisma.TransactionClient,
-    input: { checkoutId: bigint; storeId: bigint; occurredAt: Date },
+    input: {
+      checkoutId: bigint;
+      storeId: bigint;
+      mode: Mode;
+      occurredAt: Date;
+    },
   ): Promise<void> {
     const checkout = await tx.checkout.findFirst({
-      where: { id: input.checkoutId, store_id: input.storeId },
-      select: { id: true, order_id: true },
-    })
+      where: {
+        id: input.checkoutId,
+        store_id: input.storeId,
+        mode: input.mode,
+      },
+      select: {
+        id: true,
+        order_id: true,
+      },
+    });
 
     // An order already exists, so the payment did succeed at some point;
     // unwinding it is a refund, not an abandonment.
-    if (!checkout || checkout.order_id !== null) return
+    if (!checkout || checkout.order_id !== null) {
+      return;
+    }
 
     await tx.inventoryReservation.updateMany({
-      where: { checkout_id: input.checkoutId, store_id: input.storeId, state: 'held' },
-      data: { state: 'released', settled_at: input.occurredAt },
-    })
+      where: {
+        checkout_id: input.checkoutId,
+        store_id: input.storeId,
+        mode: input.mode,
+        state: 'held',
+      },
+      data: {
+        state: 'released',
+        settled_at: input.occurredAt,
+      },
+    });
 
     await tx.checkout.updateMany({
-      where: { id: input.checkoutId, store_id: input.storeId },
-      data: { status: 'failed' },
-    })
+      where: {
+        id: input.checkoutId,
+        store_id: input.storeId,
+        mode: input.mode,
+      },
+      data: {
+        status: 'failed',
+      },
+    });
   }
 
   private async nextOrderNumber(
     tx: Prisma.TransactionClient,
     storeId: bigint,
   ): Promise<string> {
-    const count = await tx.order.count({ where: { store_id: storeId } })
-    return String(1000 + count + 1)
+    const count = await tx.order.count({
+      where: {
+        store_id: storeId,
+      },
+    });
+
+    return String(1000 + count + 1);
   }
 }

@@ -1,20 +1,20 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common'
-import { Prisma } from '@prisma/client'
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import type {
   Mode,
   PaymentEventSource,
   StorePaymentMode,
-} from '@prisma/client'
-import { PrismaService } from '../../../prisma/prisma.service'
-import { LedgerService } from '../../../ledger/ledger.service'
-import { captureSucceeded, refundIssued } from '../../../ledger/posting-rules'
-import { OutboxService } from '../../../common/messaging/outbox.service'
-import { isUniqueConstraintError } from '../../../common/idempotency/idempotency.types'
-import type { ObservedFact } from '../gateways/provider.types'
-import { decideFact, type FactDecision } from './fact-decision'
-import { crossStoreQuery } from '../../../common/tenant/cross-store-query'
-import { allocate, money } from '../../../common/money/money.util'
-import { CheckoutFinalizerService } from './checkout-finalizer.service'
+} from '@prisma/client';
+import { PrismaService } from '../../../prisma/prisma.service';
+import { LedgerService } from '../../../ledger/ledger.service';
+import { captureSucceeded, refundIssued } from '../../../ledger/posting-rules';
+import { OutboxService } from '../../../common/messaging/outbox.service';
+import { isUniqueConstraintError } from '../../../common/idempotency/idempotency.types';
+import type { ObservedFact } from '../gateways/provider.types';
+import { decideFact, type FactDecision } from './fact-decision';
+import { crossStoreQuery } from '../../../common/tenant/cross-store-query';
+import { allocate, money } from '../../../common/money/money.util';
+import { CheckoutFinalizerService } from './checkout-finalizer.service';
 
 /**
  * ==================================================================
@@ -33,31 +33,31 @@ import { CheckoutFinalizerService } from './checkout-finalizer.service'
  */
 
 /** Facts that mean the money is secured and the order may exist. */
-const SECURES_FUNDS = new Set(['attempt_authorized', 'attempt_captured'])
+const SECURES_FUNDS = new Set(['attempt_authorized', 'attempt_captured']);
 
 /** Facts that mean the payment will never complete. */
 const RELEASES_FUNDS = new Set([
   'attempt_failed',
   'attempt_expired',
   'attempt_voided',
-])
+]);
 
 export type ApplyOutcome =
   | 'applied'
   | 'duplicate'
   | 'ignored'
   | 'recorded'
-  | 'unmatched'
+  | 'unmatched';
 
 export interface ApplyResult {
-  readonly outcome: ApplyOutcome
-  readonly intentId: bigint | null
-  readonly reason?: string
+  readonly outcome: ApplyOutcome;
+  readonly intentId: bigint | null;
+  readonly reason?: string;
 }
 
 @Injectable()
 export class PaymentFactApplier {
-  private readonly logger = new Logger(PaymentFactApplier.name)
+  private readonly logger = new Logger(PaymentFactApplier.name);
 
   constructor(
     private readonly prisma: PrismaService,
@@ -70,13 +70,13 @@ export class PaymentFactApplier {
     facts: readonly ObservedFact[],
     source: PaymentEventSource,
   ): Promise<ApplyResult[]> {
-    const results: ApplyResult[] = []
+    const results: ApplyResult[] = [];
 
     for (const fact of facts) {
-      results.push(await this.apply(fact, source))
+      results.push(await this.apply(fact, source));
     }
 
-    return results
+    return results;
   }
 
   /**
@@ -104,7 +104,7 @@ export class PaymentFactApplier {
             gateway_reference: fact.gatewayReference,
           },
         }),
-    )
+    );
 
     if (!attempt) {
       // Not an error: the provider may be faster than our own write, or
@@ -112,8 +112,12 @@ export class PaymentFactApplier {
       // caller decides whether to retry later.
       this.logger.warn(
         `Unmatched fact ${fact.factType} for account ${fact.accountId} ref ${fact.gatewayReference}.`,
-      )
-      return { outcome: 'unmatched', intentId: null }
+      );
+
+      return {
+        outcome: 'unmatched',
+        intentId: null,
+      };
     }
 
     const intent = await this.prisma.guarded().paymentIntent.findFirst({
@@ -122,12 +126,12 @@ export class PaymentFactApplier {
         store_id: attempt.store_id,
         mode: attempt.mode,
       },
-    })
+    });
 
     if (!intent) {
       throw new NotFoundException(
         `Attempt ${attempt.id} references a missing intent.`,
-      )
+      );
     }
 
     const decision = decideFact({
@@ -141,7 +145,7 @@ export class PaymentFactApplier {
       cumulativeAmountMinor: fact.cumulativeAmountMinor,
       providerSequence: fact.providerSequence,
       occurredAt: fact.occurredAt,
-    })
+    });
 
     if (decision.kind === 'ignore') {
       // Superseded facts are still stored. Dropping them loses the
@@ -150,13 +154,15 @@ export class PaymentFactApplier {
         applied: false,
         supersededReason: decision.reason,
         source,
-      })
+      });
+
       return {
         // A fact carrying nothing new is a duplicate, not a fault.
-        outcome: decision.reason === 'already_applied' ? 'duplicate' : 'ignored',
+        outcome:
+          decision.reason === 'already_applied' ? 'duplicate' : 'ignored',
         intentId: intent.id,
         reason: decision.reason,
-      }
+      };
     }
 
     if (decision.kind === 'record_only') {
@@ -164,193 +170,228 @@ export class PaymentFactApplier {
         applied: false,
         supersededReason: 'not_actionable',
         source,
-      })
-      return { outcome: 'recorded', intentId: intent.id, reason: decision.note }
+      });
+
+      return {
+        outcome: 'recorded',
+        intentId: intent.id,
+        reason: decision.note,
+      };
     }
 
-    const now = new Date()
+    const now = new Date();
 
     // A refund does not touch the attempt or create a capture, so it has
     // its own path rather than being forced through the capture shape.
     if (decision.kind === 'apply_refund') {
-      return this.applyRefund(fact, intent, decision, source, now)
+      return this.applyRefund(fact, intent, decision, source, now);
     }
 
     try {
-      await this.prisma.$transaction(
+      await this.prisma.guarded().$transaction(
         async (tx) => {
-        // The unique dedupe key on payment_events is the idempotency
-        // guarantee. It is inserted first so a duplicate aborts the whole
-        // transaction before anything else is written.
-        await tx.paymentEvent.create({
-          data: {
-            intent_id: intent.id,
-            store_id: intent.store_id,
-            mode: intent.mode,
-            event_type: fact.factType,
-            dedupe_key: fact.dedupeKey,
-            source,
-            applied: true,
-            payload_redacted: (fact.rawRedacted ??
-              null) as Prisma.InputJsonValue,
-            occurred_at: fact.occurredAt ?? now,
-          },
-        })
-
-        // Optimistic concurrency: if another writer moved the intent
-        // between the read and here, this matches nothing and the whole
-        // transaction is abandoned.
-        const updated = await tx.paymentIntent.updateMany({
-          where: { id: intent.id, version: intent.version },
-          data: {
-            status: decision.intentStatus,
-            captured_total_minor: decision.capturedTotalMinor,
-            refunded_total_minor: decision.refundedTotalMinor,
-            terminal_at: decision.terminal ? now : null,
-            version: { increment: 1 },
-          },
-        })
-
-        if (updated.count === 0) {
-          throw new ConcurrentIntentUpdate(intent.id)
-        }
-
-        await tx.paymentAttempt.update({
-          where: { id: attempt.id },
-          data: {
-            status: decision.attemptStatus,
-            next_action_kind: 'none',
-            gateway_payment_id:
-              fact.refs?.gatewayPaymentId ?? attempt.gateway_payment_id,
-          },
-        })
-
-        if (decision.newCaptureMinor !== null) {
-          const beneficiaryId = await this.findBeneficiary(
-            tx,
-            intent.store_id,
-            intent.mode,
-            intent.currency,
-          )
-
-          const capture = await tx.capture.create({
+          // The unique dedupe key on payment_events is the idempotency
+          // guarantee. It is inserted first so a duplicate aborts the whole
+          // transaction before anything else is written.
+          await tx.paymentEvent.create({
             data: {
               intent_id: intent.id,
-              attempt_id: attempt.id,
               store_id: intent.store_id,
               mode: intent.mode,
-              amount_minor: decision.newCaptureMinor,
-              currency: intent.currency,
-              status: 'succeeded',
-              gateway_capture_ref: fact.refs?.gatewayCaptureRef ?? null,
-              captured_at: fact.occurredAt ?? now,
+              event_type: fact.factType,
+              dedupe_key: fact.dedupeKey,
+              source,
+              applied: true,
+              payload_redacted: (fact.rawRedacted ??
+                null) as Prisma.InputJsonValue,
+              occurred_at: fact.occurredAt ?? now,
             },
-            select: { id: true },
-          })
+          });
 
-          await tx.captureAllocation.create({
+          // Optimistic concurrency: if another writer moved the intent
+          // between the read and here, this matches nothing and the whole
+          // transaction is abandoned.
+          const updated = await tx.paymentIntent.updateMany({
+            where: {
+              id: intent.id,
+              store_id: intent.store_id,
+              mode: intent.mode,
+              version: intent.version,
+            },
             data: {
-              capture_id: capture.id,
-              beneficiary_id: beneficiaryId,
-              store_id: intent.store_id,
-              mode: intent.mode,
-              amount_minor: decision.newCaptureMinor,
-              kind: 'revenue',
+              status: decision.intentStatus,
+              captured_total_minor: decision.capturedTotalMinor,
+              refunded_total_minor: decision.refundedTotalMinor,
+              terminal_at: decision.terminal ? now : null,
+              version: {
+                increment: 1,
+              },
             },
-          })
+          });
 
-          // Money captured through a gateway lands in a receivable from
-          // the provider, cleared later by the settlement.
-          await this.ledger.post(tx, {
+          if (updated.count === 0) {
+            throw new ConcurrentIntentUpdate(intent.id);
+          }
+
+          await tx.paymentAttempt.update({
+            where: {
+              id: attempt.id,
+              store_id: attempt.store_id,
+              mode: attempt.mode,
+            },
+            data: {
+              status: decision.attemptStatus,
+              next_action_kind: 'none',
+              gateway_payment_id:
+                fact.refs?.gatewayPaymentId ?? attempt.gateway_payment_id,
+            },
+          });
+
+          if (decision.newCaptureMinor !== null) {
+            const beneficiaryId = await this.findBeneficiary(
+              tx as unknown as Prisma.TransactionClient,
+              intent.store_id,
+              intent.mode,
+              intent.currency,
+            );
+
+            const capture = await tx.capture.create({
+              data: {
+                intent_id: intent.id,
+                attempt_id: attempt.id,
+                store_id: intent.store_id,
+                mode: intent.mode,
+                amount_minor: decision.newCaptureMinor,
+                currency: intent.currency,
+                status: 'succeeded',
+                gateway_capture_ref: fact.refs?.gatewayCaptureRef ?? null,
+                captured_at: fact.occurredAt ?? now,
+              },
+              select: {
+                id: true,
+              },
+            });
+
+            await tx.captureAllocation.create({
+              data: {
+                capture_id: capture.id,
+                beneficiary_id: beneficiaryId,
+                store_id: intent.store_id,
+                mode: intent.mode,
+                amount_minor: decision.newCaptureMinor,
+                kind: 'revenue',
+              },
+            });
+
+            // Money captured through a gateway lands in a receivable from
+            // the provider, cleared later by the settlement.
+            await this.ledger.post(tx as unknown as Prisma.TransactionClient, {
+              storeId: intent.store_id,
+              mode: intent.mode,
+              currency: intent.currency,
+              entryType: 'payment.captured.gateway',
+              sourceKind: 'capture',
+              sourceId: capture.id.toString(),
+              dedupeKey: `${fact.dedupeKey}:ledger`,
+              occurredAt: fact.occurredAt ?? now,
+              memo: `Capture for intent ${intent.id}`,
+              postings: captureSucceeded({
+                totalMinor: decision.newCaptureMinor,
+                paymentAccountId: fact.accountId,
+                allocations: [
+                  {
+                    beneficiaryId,
+                    amountMinor: decision.newCaptureMinor,
+                  },
+                ],
+              }),
+            });
+          }
+
+          // A funds_secured checkout has no order until here. Creating it
+          // inside this transaction is what makes "order exists implies
+          // money secured" true rather than merely usual.
+          if (intent.context_kind === 'checkout' && intent.context_id !== '') {
+            const checkoutId = BigInt(intent.context_id);
+
+            if (SECURES_FUNDS.has(fact.factType)) {
+              await this.finalizer.finalize(
+                tx as unknown as Prisma.TransactionClient,
+                {
+                  checkoutId,
+                  storeId: intent.store_id,
+                  mode: intent.mode,
+                  paid: decision.capturedTotalMinor > 0n,
+                  occurredAt: fact.occurredAt ?? now,
+                },
+              );
+            } else if (RELEASES_FUNDS.has(fact.factType)) {
+              await this.finalizer.abandon(
+                tx as unknown as Prisma.TransactionClient,
+                {
+                  checkoutId,
+                  storeId: intent.store_id,
+                  mode: intent.mode,
+                  occurredAt: fact.occurredAt ?? now,
+                },
+              );
+            }
+          }
+
+          await this.outbox.emit(tx as unknown as Prisma.TransactionClient, {
             storeId: intent.store_id,
             mode: intent.mode,
-            currency: intent.currency,
-            entryType: 'payment.captured.gateway',
-            sourceKind: 'capture',
-            sourceId: capture.id.toString(),
-            dedupeKey: `${fact.dedupeKey}:ledger`,
+            aggregateType: 'payment_intent',
+            aggregateId: intent.id.toString(),
+            eventType: `payment.${fact.factType}`,
+            payload: {
+              intentId: intent.id.toString(),
+              attemptId: attempt.id.toString(),
+              factType: fact.factType,
+              intentStatus: decision.intentStatus,
+              capturedTotalMinor: decision.capturedTotalMinor.toString(),
+              currency: intent.currency,
+            },
             occurredAt: fact.occurredAt ?? now,
-            memo: `Capture for intent ${intent.id}`,
-            postings: captureSucceeded({
-              totalMinor: decision.newCaptureMinor,
-              paymentAccountId: fact.accountId,
-              allocations: [
-                { beneficiaryId, amountMinor: decision.newCaptureMinor },
-              ],
-            }),
-          })
-        }
-
-        // A funds_secured checkout has no order until here. Creating it
-        // inside this transaction is what makes "order exists implies
-        // money secured" true rather than merely usual.
-        if (intent.context_kind === 'checkout' && intent.context_id !== '') {
-          const checkoutId = BigInt(intent.context_id)
-
-          if (SECURES_FUNDS.has(fact.factType)) {
-            await this.finalizer.finalize(tx, {
-              checkoutId,
-              storeId: intent.store_id,
-              mode: intent.mode,
-              paid: decision.capturedTotalMinor > 0n,
-              occurredAt: fact.occurredAt ?? now,
-            })
-          } else if (RELEASES_FUNDS.has(fact.factType)) {
-            await this.finalizer.abandon(tx, {
-              checkoutId,
-              storeId: intent.store_id,
-              occurredAt: fact.occurredAt ?? now,
-            })
-          }
-        }
-
-        await this.outbox.emit(tx, {
-          storeId: intent.store_id,
-          mode: intent.mode,
-          aggregateType: 'payment_intent',
-          aggregateId: intent.id.toString(),
-          eventType: `payment.${fact.factType}`,
-          payload: {
-            intentId: intent.id.toString(),
-            attemptId: attempt.id.toString(),
-            factType: fact.factType,
-            intentStatus: decision.intentStatus,
-            capturedTotalMinor: decision.capturedTotalMinor.toString(),
-            currency: intent.currency,
-          },
-          occurredAt: fact.occurredAt ?? now,
-        })
+          });
         },
-        // The default 5s is not enough once a second delivery of the
-        // same fact is blocking on the dedupe key: the loser waits for
-        // the winner to finish creating an order and moving stock.
-        { timeout: 20_000, maxWait: 10_000 },
-      )
+        {
+          timeout: 20_000,
+          maxWait: 10_000,
+        },
+      );
     } catch (error) {
       if (isUniqueConstraintError(error)) {
         // Same fact, already applied by another route.
-        return { outcome: 'duplicate', intentId: intent.id }
+        return {
+          outcome: 'duplicate',
+          intentId: intent.id,
+        };
       }
 
       if (error instanceof ConcurrentIntentUpdate) {
         this.logger.warn(
           `Intent ${intent.id} changed underneath fact ${fact.dedupeKey}; not applied.`,
-        )
+        );
+
         return {
           outcome: 'ignored',
           intentId: intent.id,
           reason: 'concurrent_update',
-        }
+        };
       }
 
-      throw error
+      throw error;
     }
 
     this.logger.log(
       `Applied ${fact.factType} to intent ${intent.id} (${decision.intentStatus}).`,
-    )
+    );
 
-    return { outcome: 'applied', intentId: intent.id }
+    return {
+      outcome: 'applied',
+      intentId: intent.id,
+    };
   }
 
   /* ---------------------------------------------------------------- */
@@ -370,14 +411,14 @@ export class PaymentFactApplier {
   private async applyRefund(
     fact: ObservedFact,
     intent: {
-      id: bigint
-      store_id: bigint
-      mode: Mode
-      currency: string
-      version: number
-      account_id: bigint | null
-      payment_mode: StorePaymentMode
-      captured_total_minor: bigint
+      id: bigint;
+      store_id: bigint;
+      mode: Mode;
+      currency: string;
+      version: number;
+      account_id: bigint | null;
+      payment_mode: StorePaymentMode;
+      captured_total_minor: bigint;
     },
     decision: Extract<FactDecision, { kind: 'apply_refund' }>,
     source: PaymentEventSource,
@@ -389,23 +430,31 @@ export class PaymentFactApplier {
       this.logger.error(
         `Refund for intent ${intent.id} uses payment mode ` +
           `${intent.payment_mode}, which has no ledger rule. Not applied.`,
-      )
+      );
+
       return {
         outcome: 'ignored',
         intentId: intent.id,
         reason: 'unsupported_payment_mode',
-      }
+      };
     }
 
     if (intent.account_id === null) {
-      this.logger.error(`Refund for intent ${intent.id} has no payment account.`)
-      return { outcome: 'ignored', intentId: intent.id, reason: 'no_account' }
+      this.logger.error(
+        `Refund for intent ${intent.id} has no payment account.`,
+      );
+
+      return {
+        outcome: 'ignored',
+        intentId: intent.id,
+        reason: 'no_account',
+      };
     }
 
-    const accountId = intent.account_id
+    const accountId = intent.account_id;
 
     try {
-      await this.prisma.$transaction(
+      await this.prisma.guarded().$transaction(
         async (tx) => {
           await tx.paymentEvent.create({
             data: {
@@ -420,26 +469,33 @@ export class PaymentFactApplier {
                 null) as Prisma.InputJsonValue,
               occurred_at: fact.occurredAt ?? now,
             },
-          })
+          });
 
           const updated = await tx.paymentIntent.updateMany({
-            where: { id: intent.id, version: intent.version },
+            where: {
+              id: intent.id,
+              store_id: intent.store_id,
+              mode: intent.mode,
+              version: intent.version,
+            },
             data: {
               status: decision.intentStatus,
               refunded_total_minor: decision.refundedTotalMinor,
-              version: { increment: 1 },
+              version: {
+                increment: 1,
+              },
             },
-          })
+          });
 
           if (updated.count === 0) {
-            throw new ConcurrentIntentUpdate(intent.id)
+            throw new ConcurrentIntentUpdate(intent.id);
           }
 
           const allocations = await this.refundAllocations(
-            tx,
+            tx as unknown as Prisma.TransactionClient,
             intent,
             decision.newRefundMinor,
-          )
+          );
 
           const refund = await tx.refund.create({
             data: {
@@ -453,8 +509,10 @@ export class PaymentFactApplier {
               gateway_refund_ref: fact.refs?.gatewayCaptureRef ?? null,
               succeeded_at: fact.occurredAt ?? now,
             },
-            select: { id: true },
-          })
+            select: {
+              id: true,
+            },
+          });
 
           await tx.refundAllocation.createMany({
             data: allocations.map((allocation) => ({
@@ -465,9 +523,9 @@ export class PaymentFactApplier {
               amount_minor: allocation.amountMinor,
               kind: 'revenue' as const,
             })),
-          })
+          });
 
-          await this.ledger.post(tx, {
+          await this.ledger.post(tx as unknown as Prisma.TransactionClient, {
             storeId: intent.store_id,
             mode: intent.mode,
             currency: intent.currency,
@@ -482,11 +540,15 @@ export class PaymentFactApplier {
               paymentAccountId: accountId,
               allocations,
             }),
-          })
+          });
 
-          await this.syncOrderRefundStatus(tx, intent, decision)
+          await this.syncOrderRefundStatus(
+            tx as unknown as Prisma.TransactionClient,
+            intent,
+            decision,
+          );
 
-          await this.outbox.emit(tx, {
+          await this.outbox.emit(tx as unknown as Prisma.TransactionClient, {
             storeId: intent.store_id,
             mode: intent.mode,
             aggregateType: 'payment_intent',
@@ -500,13 +562,19 @@ export class PaymentFactApplier {
               currency: intent.currency,
             },
             occurredAt: fact.occurredAt ?? now,
-          })
+          });
         },
-        { timeout: 20_000, maxWait: 10_000 },
-      )
+        {
+          timeout: 20_000,
+          maxWait: 10_000,
+        },
+      );
     } catch (error) {
       if (isUniqueConstraintError(error)) {
-        return { outcome: 'duplicate', intentId: intent.id }
+        return {
+          outcome: 'duplicate',
+          intentId: intent.id,
+        };
       }
 
       if (error instanceof ConcurrentIntentUpdate) {
@@ -514,18 +582,21 @@ export class PaymentFactApplier {
           outcome: 'ignored',
           intentId: intent.id,
           reason: 'concurrent_update',
-        }
+        };
       }
 
-      throw error
+      throw error;
     }
 
     this.logger.log(
       `Refunded ${decision.newRefundMinor} on intent ${intent.id} ` +
         `(${decision.intentStatus}).`,
-    )
+    );
 
-    return { outcome: 'applied', intentId: intent.id }
+    return {
+      outcome: 'applied',
+      intentId: intent.id,
+    };
   }
 
   /**
@@ -538,9 +609,19 @@ export class PaymentFactApplier {
    */
   private async refundAllocations(
     tx: Prisma.TransactionClient,
-    intent: { id: bigint; store_id: bigint; mode: Mode; currency: string },
+    intent: {
+      id: bigint;
+      store_id: bigint;
+      mode: Mode;
+      currency: string;
+    },
     amountMinor: bigint,
-  ): Promise<{ beneficiaryId: bigint; amountMinor: bigint }[]> {
+  ): Promise<
+    {
+      beneficiaryId: bigint;
+      amountMinor: bigint;
+    }[]
+  > {
     // Scoped to this intent's own captures. Querying every allocation in
     // the store would split a refund across beneficiaries of unrelated
     // orders — invisible while there is one beneficiary, badly wrong the
@@ -549,59 +630,91 @@ export class PaymentFactApplier {
       where: {
         intent_id: intent.id,
         store_id: intent.store_id,
+        mode: intent.mode,
         status: 'succeeded',
       },
-      select: { id: true },
-    })
+      select: {
+        id: true,
+      },
+    });
 
     if (captures.length === 0) {
-      throw new Error(`Intent ${intent.id} has no successful capture to refund.`)
+      throw new Error(
+        `Intent ${intent.id} has no successful capture to refund.`,
+      );
     }
 
     const captured = await tx.captureAllocation.findMany({
-      where: { capture_id: { in: captures.map((capture) => capture.id) } },
-      select: { beneficiary_id: true, amount_minor: true },
-    })
+      where: {
+        capture_id: {
+          in: captures.map((capture) => capture.id),
+        },
+        store_id: intent.store_id,
+        mode: intent.mode,
+      },
+      select: {
+        beneficiary_id: true,
+        amount_minor: true,
+      },
+    });
 
-    const totals = new Map<string, bigint>()
+    const totals = new Map<string, bigint>();
 
     for (const row of captured) {
-      const key = row.beneficiary_id.toString()
-      totals.set(key, (totals.get(key) ?? 0n) + row.amount_minor)
+      const key = row.beneficiary_id.toString();
+
+      totals.set(key, (totals.get(key) ?? 0n) + row.amount_minor);
     }
 
     if (totals.size === 0) {
       throw new Error(
         `Intent ${intent.id} has no capture allocations to refund against.`,
-      )
+      );
     }
 
-    const entries = [...totals.entries()]
-    const weights = entries.map(([, amount]) => amount)
+    const entries = [...totals.entries()];
+
+    const weights = entries.map(([, amount]) => amount);
 
     // The intent's real currency, not a placeholder. money() validates
     // against the registry, so a placeholder threw on every refund.
-    const shares = allocate(money(amountMinor, intent.currency), weights)
+    const shares = allocate(money(amountMinor, intent.currency), weights);
 
     return entries.map(([beneficiaryId], index) => ({
       beneficiaryId: BigInt(beneficiaryId),
       amountMinor: shares[index].amountMinor,
-    }))
+    }));
   }
 
   /** Keeps the order's payment_status in step with the intent. */
   private async syncOrderRefundStatus(
     tx: Prisma.TransactionClient,
-    intent: { store_id: bigint; mode: Mode; id: bigint },
+    intent: {
+      store_id: bigint;
+      mode: Mode;
+      id: bigint;
+    },
     decision: Extract<FactDecision, { kind: 'apply_refund' }>,
   ): Promise<void> {
     const checkoutIntent = await tx.paymentIntent.findFirst({
-      where: { id: intent.id },
-      select: { context_kind: true, context_id: true },
-    })
+      where: {
+        id: intent.id,
+        store_id: intent.store_id,
+        mode: intent.mode,
+      },
+      select: {
+        context_kind: true,
+        context_id: true,
+      },
+    });
 
-    if (checkoutIntent?.context_kind !== 'checkout') return
-    if (!checkoutIntent.context_id) return
+    if (checkoutIntent?.context_kind !== 'checkout') {
+      return;
+    }
+
+    if (!checkoutIntent.context_id) {
+      return;
+    }
 
     await tx.order.updateMany({
       where: {
@@ -610,9 +723,11 @@ export class PaymentFactApplier {
       },
       data: {
         payment_status:
-          decision.intentStatus === 'refunded' ? 'REFUNDED' : 'PARTIALLY_REFUNDED',
+          decision.intentStatus === 'refunded'
+            ? 'REFUNDED'
+            : 'PARTIALLY_REFUNDED',
       },
-    })
+    });
   }
 
   private async recordEvent(
@@ -621,9 +736,9 @@ export class PaymentFactApplier {
     storeId: bigint,
     mode: Mode,
     options: {
-      applied: boolean
-      supersededReason: string
-      source: PaymentEventSource
+      applied: boolean;
+      supersededReason: string;
+      source: PaymentEventSource;
     },
   ): Promise<void> {
     try {
@@ -640,10 +755,12 @@ export class PaymentFactApplier {
           payload_redacted: (fact.rawRedacted ?? null) as Prisma.InputJsonValue,
           occurred_at: fact.occurredAt ?? new Date(),
         },
-      })
+      });
     } catch (error) {
       // Already recorded by another route; nothing further to do.
-      if (!isUniqueConstraintError(error)) throw error
+      if (!isUniqueConstraintError(error)) {
+        throw error;
+      }
     }
   }
 
@@ -663,19 +780,33 @@ export class PaymentFactApplier {
     mode: Mode,
     currency: string,
   ): Promise<bigint> {
-    const lockKey = `beneficiary:${storeId}:${mode}`
+    const lockKey = `beneficiary:${storeId}:${mode}`;
+
     // $executeRaw, not $queryRaw: pg_advisory_xact_lock returns void and
     // Prisma has no deserializer for that type, so $queryRaw fails with
     // "Failed to deserialize column of type 'void'". Nothing reads the
     // result here — the statement is executed purely for the lock.
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`
+    await tx.$executeRaw`
+      SELECT pg_advisory_xact_lock(
+        hashtext(${lockKey})
+      )
+    `;
 
     const existing = await tx.beneficiary.findFirst({
-      where: { store_id: storeId, mode, kind: 'store', external_ref: null },
-      select: { id: true },
-    })
+      where: {
+        store_id: storeId,
+        mode,
+        kind: 'store',
+        external_ref: null,
+      },
+      select: {
+        id: true,
+      },
+    });
 
-    if (existing) return existing.id
+    if (existing) {
+      return existing.id;
+    }
 
     const created = await tx.beneficiary.create({
       data: {
@@ -685,18 +816,20 @@ export class PaymentFactApplier {
         external_ref: null,
         default_currency: currency,
       },
-      select: { id: true },
-    })
+      select: {
+        id: true,
+      },
+    });
 
-    return created.id
+    return created.id;
   }
 }
 
 /** Raised when optimistic concurrency rejects the update. */
 class ConcurrentIntentUpdate extends Error {
   constructor(readonly intentId: bigint) {
-    super(`Intent ${intentId} was modified concurrently.`)
-    this.name = 'ConcurrentIntentUpdate'
-    Object.setPrototypeOf(this, ConcurrentIntentUpdate.prototype)
+    super(`Intent ${intentId} was modified concurrently.`);
+    this.name = 'ConcurrentIntentUpdate';
+    Object.setPrototypeOf(this, ConcurrentIntentUpdate.prototype);
   }
 }

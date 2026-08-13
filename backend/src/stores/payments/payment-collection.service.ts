@@ -4,15 +4,15 @@ import {
   Injectable,
   Logger,
   NotFoundException,
-} from '@nestjs/common'
-import { Prisma } from '@prisma/client'
-import type { Mode } from '@prisma/client'
-import { PrismaService } from '../../prisma/prisma.service'
-import { LedgerService } from '../../ledger/ledger.service'
-import { offlineCollected } from '../../ledger/posting-rules'
-import { OutboxService } from '../../common/messaging/outbox.service'
-import { parseDecimal } from '../../common/money/money.util'
-import { assertIntentTransition } from './payment-intent.state'
+} from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import type { Mode } from '@prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { LedgerService } from '../../ledger/ledger.service';
+import { offlineCollected } from '../../ledger/posting-rules';
+import { OutboxService } from '../../common/messaging/outbox.service';
+import { parseDecimal } from '../../common/money/money.util';
+import { assertIntentTransition } from './payment-intent.state';
 
 /**
  * ==================================================================
@@ -32,7 +32,7 @@ import { assertIntentTransition } from './payment-intent.state'
  */
 @Injectable()
 export class PaymentCollectionService {
-  private readonly logger = new Logger(PaymentCollectionService.name)
+  private readonly logger = new Logger(PaymentCollectionService.name);
 
   constructor(
     private readonly prisma: PrismaService,
@@ -45,20 +45,20 @@ export class PaymentCollectionService {
     orderId: string,
     options: { mode?: Mode; reference?: string } = {},
   ) {
-    const mode: Mode = options.mode ?? 'live'
+    const mode: Mode = options.mode ?? 'live';
 
     const order = await this.prisma.guarded().order.findFirst({
       where: { id: BigInt(orderId), store_id: storeId },
-    })
+    });
 
-    if (!order) throw new NotFoundException('Order not found.')
+    if (!order) throw new NotFoundException('Order not found.');
 
     if (order.payment_status === 'PAID') {
-      throw new ConflictException('Order is already marked as paid.')
+      throw new ConflictException('Order is already marked as paid.');
     }
 
     if (order.payment_status === 'REFUNDED') {
-      throw new ConflictException('A refunded order cannot be marked as paid.')
+      throw new ConflictException('A refunded order cannot be marked as paid.');
     }
 
     // Legacy orders predate checkout and have no committed receivable, so
@@ -67,14 +67,14 @@ export class PaymentCollectionService {
     if (order.checkout_id === null) {
       throw new BadRequestException(
         'This order was not created through checkout and has no ledger entry to settle.',
-      )
+      );
     }
 
-    const currency = (order.currency || 'USD').toUpperCase()
-    const total = parseDecimal(String(order.total), currency)
+    const currency = (order.currency || 'USD').toUpperCase();
+    const total = parseDecimal(String(order.total), currency);
 
     if (total.amountMinor <= 0n) {
-      throw new BadRequestException('Order total must be greater than zero.')
+      throw new BadRequestException('Order total must be greater than zero.');
     }
 
     const intent = await this.prisma.guarded().paymentIntent.findFirst({
@@ -84,26 +84,26 @@ export class PaymentCollectionService {
         context_kind: 'checkout',
         context_id: order.checkout_id.toString(),
       },
-    })
+    });
 
     if (!intent) {
-      throw new NotFoundException('No payment intent found for this order.')
+      throw new NotFoundException('No payment intent found for this order.');
     }
 
-    assertIntentTransition(intent.status, 'captured')
+    assertIntentTransition(intent.status, 'captured');
 
     const beneficiary = await this.prisma.guarded().beneficiary.findFirst({
       where: { store_id: storeId, mode, kind: 'store', external_ref: null },
       select: { id: true },
-    })
+    });
 
     if (!beneficiary) {
-      throw new NotFoundException('Store beneficiary is missing.')
+      throw new NotFoundException('Store beneficiary is missing.');
     }
 
-    const now = new Date()
+    const now = new Date();
 
-    const updated = await this.prisma.$transaction(async (tx) => {
+    const updated = await this.prisma.guarded().$transaction(async (tx) => {
       // Compare-and-set claim. This is the concurrency guard: only one
       // transaction can flip UNPAID -> PAID. A second concurrent caller
       // blocks on the row lock, re-evaluates the WHERE after the first
@@ -117,12 +117,12 @@ export class PaymentCollectionService {
       const claimed = await tx.order.updateMany({
         where: { id: order.id, store_id: storeId, payment_status: 'UNPAID' },
         data: { payment_status: 'PAID', paid_at: now },
-      })
+      });
 
       if (claimed.count === 0) {
         throw new ConflictException(
           'Order was marked as paid by another request.',
-        )
+        );
       }
 
       const capture = await tx.capture.create({
@@ -137,7 +137,7 @@ export class PaymentCollectionService {
           captured_at: now,
         },
         select: { id: true },
-      })
+      });
 
       await tx.captureAllocation.create({
         data: {
@@ -148,22 +148,31 @@ export class PaymentCollectionService {
           amount_minor: total.amountMinor,
           kind: 'revenue',
         },
-      })
+      });
 
       await tx.paymentIntent.update({
-        where: { id: intent.id },
+        where: {
+          id: intent.id,
+          store_id: storeId,
+          mode,
+        },
         data: {
           status: 'captured',
           captured_total_minor: total.amountMinor,
           terminal_at: now,
           version: { increment: 1 },
         },
-      })
+      });
 
       await tx.paymentAttempt.updateMany({
-        where: { intent_id: intent.id, status: { notIn: ['succeeded', 'failed'] } },
+        where: {
+          intent_id: intent.id,
+          store_id: storeId,
+          mode,
+          status: { notIn: ['succeeded', 'failed'] },
+        },
         data: { status: 'succeeded', next_action_kind: 'none' },
-      })
+      });
 
       await tx.paymentEvent.create({
         data: {
@@ -182,10 +191,10 @@ export class PaymentCollectionService {
           } as Prisma.InputJsonValue,
           occurred_at: now,
         },
-      })
+      });
 
       // Clears the receivable opened at commitment.
-      await this.ledger.post(tx, {
+      await this.ledger.post(tx as unknown as Prisma.TransactionClient, {
         storeId,
         mode,
         currency,
@@ -196,7 +205,7 @@ export class PaymentCollectionService {
         occurredAt: now,
         memo: `Collection for order ${order.order_number}`,
         postings: offlineCollected({ totalMinor: total.amountMinor }),
-      })
+      });
 
       // Already updated by the claim above; read it back for the response.
       const saved = await tx.order.findFirstOrThrow({
@@ -208,9 +217,9 @@ export class PaymentCollectionService {
           paid_at: true,
           status: true,
         },
-      })
+      });
 
-      await this.outbox.emit(tx, {
+      await this.outbox.emit(tx as unknown as Prisma.TransactionClient, {
         storeId,
         mode,
         aggregateType: 'order',
@@ -225,14 +234,14 @@ export class PaymentCollectionService {
           currency,
         },
         occurredAt: now,
-      })
+      });
 
-      return saved
-    })
+      return saved;
+    });
 
     this.logger.log(
       `Offline payment collected: store ${storeId} order ${updated.order_number} ${total.amountMinor} ${currency}`,
-    )
+    );
 
     return {
       id: updated.id.toString(),
@@ -240,6 +249,6 @@ export class PaymentCollectionService {
       status: updated.status,
       payment_status: updated.payment_status,
       paid_at: updated.paid_at,
-    }
+    };
   }
 }

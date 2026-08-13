@@ -7,7 +7,10 @@ import { createTenantGuardExtension } from '../common/tenant/tenant-guard.extens
 import type { TenantConfig } from '../common/config/configuration';
 
 @Injectable()
-export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+export class PrismaService
+  extends PrismaClient
+  implements OnModuleInit, OnModuleDestroy
+{
   /**
    * كاش للعميل الموسّع بحارس العزل.
    *
@@ -15,23 +18,23 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
    * حقل معرّف بالنوع المستنتج بيعمل دورة استنتاج في TypeScript.
    * التحويل بيحصل في guarded() نفسها، فالمستدعي بياخد النوع الصح.
    */
-  private guardedCache: unknown = null
+  private guardedCache: unknown = null;
 
   constructor(
     private eventEmitter: EventEmitter2,
     private readonly config: ConfigService,
     private readonly tenantContext: TenantContextService,
   ) {
-    super()
+    super();
   }
 
   async onModuleInit() {
-    await this.$connect()
-    console.log('✅ Database connected successfully!')
+    await this.$connect();
+    console.log('✅ Database connected successfully!');
   }
 
   async onModuleDestroy() {
-    await this.$disconnect()
+    await this.$disconnect();
   }
 
   /**
@@ -50,20 +53,21 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
    */
   guarded() {
     if (!this.guardedCache) {
-      this.guardedCache = this.buildGuardedClient()
+      this.guardedCache = this.buildGuardedClient();
     }
-    return this.guardedCache as ReturnType<PrismaService['buildGuardedClient']>
+    return this.guardedCache as ReturnType<PrismaService['buildGuardedClient']>;
   }
 
   private buildGuardedClient() {
-    const tenant = this.config.get<TenantConfig>('tenant')
+    const tenant = this.config.get<TenantConfig>('tenant');
 
     return this.$extends(
       createTenantGuardExtension({
         enabled: tenant?.guardEnabled ?? false,
+        throwOnViolation: tenant?.throwOnViolation ?? false,
         tenantContext: this.tenantContext,
       }),
-    )
+    );
   }
 
   /**
@@ -72,38 +76,38 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
   async deleteDevice(deviceId: bigint) {
     const device = await this.devices.findFirst({
       where: { id: deviceId },
-      select: { id: true, user_id: true }
-    })
+      select: { id: true, user_id: true },
+    });
 
     const result = await this.devices.delete({
-      where: { id: deviceId }
-    })
+      where: { id: deviceId },
+    });
 
     if (device) {
       this.eventEmitter.emit('device.deleted', {
         deviceId: device.id.toString(),
-        userId: device.user_id.toString()
-      })
+        userId: device.user_id.toString(),
+      });
     }
 
-    return result
+    return result;
   }
 
   async deleteManyDevices(where: any) {
     const devices = await this.devices.findMany({
       where,
-      select: { id: true, user_id: true }
-    })
+      select: { id: true, user_id: true },
+    });
 
-    const result = await this.devices.deleteMany({ where })
+    const result = await this.devices.deleteMany({ where });
 
     for (const device of devices) {
       this.eventEmitter.emit('device.deleted', {
         deviceId: device.id.toString(),
-        userId: device.user_id.toString()
-      })
+        userId: device.user_id.toString(),
+      });
     }
 
-    return result
+    return result;
   }
 }

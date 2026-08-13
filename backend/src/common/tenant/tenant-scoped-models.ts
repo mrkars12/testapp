@@ -13,28 +13,35 @@
  */
 export interface TenantScopedModel {
   /** اسم الموديل زي ما هو في Prisma (مش اسم الجدول) */
-  readonly model: string
-  readonly storeField: string
+  readonly model: string;
+
+  readonly storeField: string;
+
   /** null لو الموديل مالوش وضع test/live */
-  readonly modeField: string | null
+  readonly modeField: string | null;
+
   /**
    * اسم العلاقة اللي بتوصّل للمتجر، لو موجودة.
    *
    * Prisma بيقبل الشكلين:
-   *   where: { store_id: 5n }        ← scalar
-   *   where: { store: { id: 5n } }   ← relation
+   * where: { store_id: 5n }        ← scalar
+   * where: { store: { id: 5n } }  ← relation
    *
    * الاتنين نطاق صحيح تماماً. الحارس كان بيعرف الأول بس، فكان بيبلّغ
    * عن استعلام سليم — وحارس بيصرخ على كود صح بيتعلّم الناس يتجاهلوه.
    *
    * الافتراضي 'store'.
    */
-  readonly storeRelation?: string
+  readonly storeRelation?: string;
 }
 
 export const TENANT_SCOPED_MODELS: readonly TenantScopedModel[] = [
   // ── البنية التحتية (المرحلة 1a) ────────────────────────────────
-  { model: 'PaymentIdempotencyRecord', storeField: 'store_id', modeField: 'mode' },
+  {
+    model: 'PaymentIdempotencyRecord',
+    storeField: 'store_id',
+    modeField: 'mode',
+  },
   { model: 'OutboxMessage', storeField: 'store_id', modeField: 'mode' },
   { model: 'ConsumedEvent', storeField: 'store_id', modeField: 'mode' },
 
@@ -68,7 +75,7 @@ export const TENANT_SCOPED_MODELS: readonly TenantScopedModel[] = [
   // مملوكة لمتجر واحد: استعلام من غير store_id عليها بيرجّع كتالوج أو
   // طلبات تاجر تاني.
   //
-  // ⚠️ التسجيل هنا **مابيغيّرش أي سلوك حالي**. الحارس بيشتغل بس على
+  // ⚠️ التسجيل هنا مابيغيّرش أي سلوك حالي. الحارس بيشتغل بس على
   // الاستعلامات اللي بتعدّي على guarded()، ومفيش خدمة من دول بتستخدمها
   // لسه. التسجيل بيخلي السجل صادق، ولما الخدمات دي تتحوّل بعدين يبقى
   // الحارس شايفها من أول يوم.
@@ -77,19 +84,31 @@ export const TENANT_SCOPED_MODELS: readonly TenantScopedModel[] = [
   { model: 'Tag', storeField: 'store_id', modeField: null },
   { model: 'Order', storeField: 'store_id', modeField: null },
   { model: 'Upload', storeField: 'store_id', modeField: null },
+
+  // Collection يستخدم storeId كاسم حقل Prisma.
+  {
+    model: 'Collection',
+    storeField: 'storeId',
+    modeField: null,
+    storeRelation: 'store',
+  },
+
   { model: 'StoreTheme', storeField: 'store_id', modeField: null },
   { model: 'StoreThemePublished', storeField: 'store_id', modeField: null },
   { model: 'ThemeSection', storeField: 'store_id', modeField: null },
   { model: 'StorePage', storeField: 'store_id', modeField: null },
   { model: 'StoreMenu', storeField: 'store_id', modeField: null },
-]
+];
 
 /**
- * موديلات فيها store_id لكن **مش** مشمولة بالحارس، وليه.
+ * موديلات فيها store_id لكن مش مشمولة بالحارس، وليه.
  *
  * موجودة كتوثيق صريح: الفرق بين "اتنسي" و"اتقرر" لازم يكون مكتوب.
  */
-export const DELIBERATELY_UNSCOPED: readonly { model: string; reason: string }[] = [
+export const DELIBERATELY_UNSCOPED: readonly {
+  model: string;
+  reason: string;
+}[] = [
   {
     model: 'CheckoutLineItem',
     reason: 'مالوش store_id — مربوط بالـ checkout اللي بيملكه',
@@ -102,27 +121,43 @@ export const DELIBERATELY_UNSCOPED: readonly { model: string; reason: string }[]
     model: 'LedgerPosting',
     reason: 'مالوش store_id — مربوط بالقيد اللي بيملكه',
   },
-]
+];
 
 const BY_MODEL: ReadonlyMap<string, TenantScopedModel> = new Map(
   TENANT_SCOPED_MODELS.map((entry) => [entry.model, entry]),
-)
+);
 
-export function getTenantScopedModel(model: string | undefined): TenantScopedModel | undefined {
-  if (!model) return undefined
-  return BY_MODEL.get(model)
+export function getTenantScopedModel(
+  model: string | undefined,
+): TenantScopedModel | undefined {
+  if (!model) return undefined;
+  return BY_MODEL.get(model);
 }
 
 /** عمليات القراءة — بتتفحص الـ where */
 export const READ_OPERATIONS = new Set([
-  'findUnique', 'findUniqueOrThrow', 'findFirst', 'findFirstOrThrow',
-  'findMany', 'count', 'aggregate', 'groupBy',
-])
+  'findUnique',
+  'findUniqueOrThrow',
+  'findFirst',
+  'findFirstOrThrow',
+  'findMany',
+  'count',
+  'aggregate',
+  'groupBy',
+]);
 
 /** عمليات التعديل والحذف — بتتفحص الـ where كمان */
 export const WRITE_WITH_WHERE_OPERATIONS = new Set([
-  'update', 'updateMany', 'delete', 'deleteMany', 'upsert',
-])
+  'update',
+  'updateMany',
+  'delete',
+  'deleteMany',
+  'upsert',
+]);
 
 /** عمليات الإنشاء — بتتفحص الـ data */
-export const CREATE_OPERATIONS = new Set(['create', 'createMany', 'createManyAndReturn'])
+export const CREATE_OPERATIONS = new Set([
+  'create',
+  'createMany',
+  'createManyAndReturn',
+]);

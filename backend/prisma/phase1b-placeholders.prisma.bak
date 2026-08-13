@@ -1,0 +1,228 @@
+// ═══════════════════════════════════════════════════════════════════
+// ⚠️  أرشيف — ده مش ملف schema فعّال. متحطهوش باسم schema.prisma.
+//
+// الموديلات دي اتشالت من prisma/schema.prisma قبل هجرة المرحلة 1a،
+// لأن جداولها مش موجودة في قاعدة البيانات ووجودها في الـ schema كان
+// بيخلي الهجرة تحاول تنشئها.
+//
+// بترجع بشكلها النهائي في المرحلة 1b. Prisma مابيقراش الملف ده.
+// ═══════════════════════════════════════════════════════════════════
+
+enum PaymentTransactionStatus {
+  CREATED
+
+  PENDING
+
+  WAITING_CUSTOMER
+
+  PROCESSING
+
+  AUTHORIZED
+
+  CAPTURED
+
+  SUCCEEDED
+
+  FAILED
+
+  CANCELLED
+
+  EXPIRED
+
+  PARTIALLY_REFUNDED
+
+  REFUNDED
+
+  CHARGEBACK
+
+  DISPUTED
+}
+
+model PaymentTransaction {
+  id BigInt @id @default(autoincrement())
+
+  // العلاقات
+  store_id BigInt
+  order_id BigInt
+
+  store store @relation(fields: [store_id], references: [id], onDelete: Cascade)
+  order Order @relation(fields: [order_id], references: [id], onDelete: Cascade)
+
+  // البوابة
+  provider PaymentProviderKey
+
+  type PaymentTransactionType @default(PAYMENT)
+
+  // حالة المعاملة
+  status PaymentTransactionStatus @default(CREATED)
+
+  // المبلغ
+  amount   Decimal @db.Decimal(12, 2)
+  currency String  @db.VarChar(10)
+
+  // مرجع داخلي
+  merchant_reference String @db.VarChar(255)
+
+  // معرفات البوابة
+  gateway_order_id    String?
+  gateway_payment_id  String?
+  gateway_capture_id  String?
+  gateway_reference   String?
+  gateway_customer_id String?
+
+  // حماية من تكرار الطلب
+  idempotency_key String? @unique
+
+  // لماذا فشلت العملية؟
+  failure_code   String?
+  failure_reason String?
+
+  // ماذا أرسلنا وماذا رجع؟
+  provider_request  Json?
+  provider_response Json?
+
+  // بيانات إضافية
+  metadata Json?
+
+  // التوقيتات
+  verified_at DateTime?
+  paid_at     DateTime?
+  expires_at  DateTime?
+  source      String?
+  created_at  DateTime  @default(now())
+  updated_at  DateTime  @updatedAt
+
+  // العلاقات
+  events       PaymentEvent[]
+  refunds      PaymentRefund[]
+  webhook_logs PaymentWebhookLog[]
+
+  @@unique([provider, gateway_reference])
+  @@index([store_id])
+  @@index([order_id])
+  @@index([provider])
+  @@index([status])
+  @@index([store_id, status])
+  @@index([order_id, status])
+  @@index([created_at])
+}
+
+enum PaymentEventType {
+  CREATED
+
+  REDIRECTED
+
+  WEBHOOK_RECEIVED
+
+  VERIFIED
+
+  AUTHORIZED
+
+  CAPTURED
+
+  SUCCEEDED
+
+  FAILED
+
+  CANCELLED
+
+  EXPIRED
+
+  REFUND_CREATED
+
+  REFUND_COMPLETED
+}
+
+model PaymentEvent {
+  id BigInt @id @default(autoincrement())
+
+  transaction_id BigInt
+
+  transaction PaymentTransaction @relation(fields: [transaction_id], references: [id], onDelete: Cascade)
+
+  type    PaymentEventType
+  message String?
+  payload Json?
+
+  created_at DateTime @default(now())
+
+  @@index([transaction_id])
+}
+
+enum RefundStatus {
+  PENDING
+
+  SUCCEEDED
+
+  FAILED
+}
+
+model PaymentRefund {
+  id BigInt @id @default(autoincrement())
+
+  transaction_id BigInt
+
+  transaction PaymentTransaction @relation(fields: [transaction_id], references: [id], onDelete: Cascade)
+
+  amount Decimal @db.Decimal(12, 2)
+
+  reason            String?
+  gateway_refund_id String?
+
+  provider_response Json?
+
+  status RefundStatus
+
+  refunded_at DateTime?
+
+  currency String @db.VarChar(10)
+
+  provider PaymentProviderKey
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([transaction_id])
+}
+
+model PaymentWebhookLog {
+  id BigInt @id @default(autoincrement())
+
+  transaction_id BigInt?
+
+  transaction PaymentTransaction? @relation(fields: [transaction_id], references: [id])
+
+  provider PaymentProviderKey
+
+  event_name String?
+  signature  String?
+
+  headers Json?
+  payload Json
+
+  processed Boolean @default(false)
+
+  error String?
+
+  received_at  DateTime  @default(now())
+  processed_at DateTime?
+
+  provider_event_id String?
+
+  status_code            Int?
+  processing_duration_ms Int?
+
+  is_duplicate Boolean @default(false)
+
+  @@index([transaction_id])
+  @@index([provider])
+  @@index([provider_event_id])
+}
+
+enum PaymentTransactionType {
+  PAYMENT
+  REFUND
+  AUTHORIZATION
+  CAPTURE
+  VOID
+}

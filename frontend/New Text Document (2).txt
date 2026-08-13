@@ -1,0 +1,2050 @@
+'use client'
+
+import { useState, useRef, useEffect, useCallback } from "react";
+
+/* ─── Types ─────────────────────────────────────────────────────────────── */
+interface VariantOption { name: string; values: string[] }
+interface VariantRow {
+  combination: string[]; price: string; salePrice: string;
+  quantity: number; sku: string; image: ProductImage | null; active: boolean;
+}
+interface ProductImage { url: string; alt: string; file?: File; type: "image" | "video" }
+type Tag = { id: string; name: string; _pending?: boolean };
+type ProductType = { id: string; name: string; _pending?: boolean };
+interface ProductFormState {
+  title: string; description: string; url_handle: string; status: string;
+  product_type: ProductType | null; tags: Tag[];
+  price: string; compare_at_price: string; cost_per_item: string;
+  charge_tax: boolean; track_inventory: boolean; quantity: number;
+  sku: string; barcode: string; continue_selling: boolean;
+  category: string; options: VariantOption[]; images: ProductImage[]; variants: VariantRow[];
+}
+
+/* ─── Helpers ────────────────────────────────────────────────────────────── */
+function toHandle(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-");
+}
+function stripHtml(html: string): string {
+  return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/* ─── Constants ──────────────────────────────────────────────────────────── */
+const CATEGORY_TREE: Record<string, string[]> = {
+  "Apparel & Accessories": ["Clothing", "Costumes", "Jewelry", "Shoe Accessories"],
+  Electronics: ["Audio", "Computers", "GPS", "Networking", "Video"],
+  "Food & Beverages": ["Beverages", "Food Items", "Tobacco"],
+  "Health & Beauty": ["Health Care", "Personal Care", "Vision Care"],
+  "Home & Garden": ["Bathroom", "Bedding", "Cleaning", "Decor"],
+};
+const TOP_CATEGORIES = Object.keys(CATEGORY_TREE);
+const PRESET_OPTION_NAMES = ["Color", "Size", "Material", "Style", "Weight", "Volume"];
+const OPTION_SUGGESTIONS: Record<string, string[]> = {
+  Color: ["Red","Blue","Green","Black","White","Yellow","Purple","Pink","Orange","Gray"],
+  Size: ["XS","S","M","L","XL","XXL","One Size"],
+  Material: ["Cotton","Polyester","Wool","Silk","Leather","Linen","Nylon"],
+  Style: ["Classic","Modern","Vintage","Casual","Formal","Sport"],
+  Weight: ["100g","250g","500g","1kg","2kg","5kg"],
+  Volume: ["50ml","100ml","250ml","500ml","1L","2L"],
+};
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/jpg"];
+
+let _pid = 0;
+const newPendingId = () => `__p__${++_pid}`;
+
+function buildCombinations(options: VariantOption[]): string[][] {
+  const filled = options.filter(o => o.name && o.values.filter(Boolean).length > 0);
+  if (!filled.length) return [];
+  let result: string[][] = [[]];
+  for (const opt of filled) {
+    const vals = opt.values.filter(Boolean);
+    const next: string[][] = [];
+    for (const existing of result) for (const v of vals) next.push([...existing, v]);
+    result = next;
+  }
+  return result;
+}
+/**
+ * Sync variants when options change.
+ * Exact key match only → reordering options resets prices to 0,
+ * reverting to the original order restores the old prices.
+ */
+function syncVariants(options: VariantOption[], existing: VariantRow[]): VariantRow[] {
+  return buildCombinations(options).map(combo => {
+    const key = combo.join("|");
+    const found = existing.find(r => r.combination.join("|") === key);
+    return found ? { ...found, combination: combo } : { combination: combo, price: "", salePrice: "", quantity: 0, sku: "", image: null, active: true };
+  });
+}
+
+/* ─── Shared styles ─────────────────────────────────────────────────────── */
+const S = {
+  body: { fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', margin: 0, background: "#f1f1f1", minHeight: "100vh" } as React.CSSProperties,
+  topbar: { background: "#1a1a1a", padding: "9px 16px", display: "flex", alignItems: "center", gap: 12, position: "sticky", top: 0, zIndex: 300 } as React.CSSProperties,
+  card: { background: "#fff", borderRadius: 12, border: "1px solid #e3e3e3", padding: "20px", marginBottom: 12, position: "relative" } as React.CSSProperties,
+  label: { display: "block", fontSize: 13, fontWeight: 600, color: "#303030", marginBottom: 5 } as React.CSSProperties,
+  inp: { width: "100%", padding: "7px 10px", fontSize: 14, border: "1px solid #c9cccf", borderRadius: 7, outline: "none", background: "#fff", color: "#303030", boxSizing: "border-box" as const, transition: "border-color 0.15s,box-shadow 0.15s" },
+  drop: { position: "fixed" as const, background: "#fff", border: "1px solid #c9cccf", borderRadius: 8, boxShadow: "0 4px 20px rgba(0,0,0,0.15)", zIndex: 9999, overflow: "hidden", maxHeight: 240, overflowY: "auto" as const },
+  dropItem: { padding: "9px 12px", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", gap: 8, color: "#303030", background: "none", border: "none", width: "100%", textAlign: "left" as const },
+  sectionTitle: { fontSize: 15, fontWeight: 600, color: "#303030", display: "block", marginBottom: 14 } as React.CSSProperties,
+  pillBtn: { display: "inline-flex", alignItems: "center", gap: 4, padding: "5px 10px", fontSize: 13, color: "#303030", background: "#f1f1f1", border: "1px solid #d9d9d9", borderRadius: 6, cursor: "pointer", fontWeight: 400, whiteSpace: "nowrap" as const } as React.CSSProperties,
+};
+
+/* ─── Dropdown position hook ─────────────────────────────────────────────── */
+function useDropdownPosition(open: boolean, ref: React.RefObject<HTMLDivElement | null>) {
+  const [rect, setRect] = useState<DOMRect | null>(null);
+  const recalc = useCallback(() => {
+    if (ref.current) setRect(ref.current.getBoundingClientRect());
+  }, [ref]);
+  useEffect(() => {
+    if (!open) return;
+    recalc();
+    window.addEventListener("scroll", recalc, true);
+    window.addEventListener("resize", recalc);
+    return () => {
+      window.removeEventListener("scroll", recalc, true);
+      window.removeEventListener("resize", recalc);
+    };
+  }, [open, recalc]);
+  return { rect, recalc };
+}
+
+/* ─── Toggle ─────────────────────────────────────────────────────────────── */
+function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button type="button" onClick={() => onChange(!checked)}
+      style={{ width: 38, height: 22, borderRadius: 11, background: checked ? "#1a9c3e" : "#babfc3", border: "none", cursor: "pointer", position: "relative", padding: 0, flexShrink: 0, transition: "background .2s" }}>
+      <span style={{ position: "absolute", top: 3, left: checked ? 18 : 3, width: 16, height: 16, borderRadius: "50%", background: "#fff", boxShadow: "0 1px 3px rgba(0,0,0,.3)", transition: "left .2s" }} />
+    </button>
+  );
+}
+
+function DragHandle() {
+  return (
+    <div style={{ cursor: "grab", color: "#d0d0d0", display: "flex", alignItems: "center", padding: "0 2px", flexShrink: 0 }}>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+        <circle cx="9" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/>
+        <circle cx="15" cy="6" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="15" cy="18" r="1.5"/>
+      </svg>
+    </div>
+  );
+}
+function TrashIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>;
+}
+function EditIcon() {
+  return <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>;
+}
+/** Single chevron that rotates — avoids React insertBefore errors inside buttons */
+function Chevron({ up }: { up?: boolean }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+      style={{ transition: "transform 0.2s", transform: up ? "rotate(180deg)" : "rotate(0deg)", flexShrink: 0 }}>
+      <polyline points="6 9 12 15 18 9"/>
+    </svg>
+  );
+}
+function IconBtn({ onClick, danger, title, children }: { onClick: (e: React.MouseEvent) => void; danger?: boolean; title?: string; children: React.ReactNode }) {
+  const [hov, setHov] = useState(false);
+  return (
+    <button onClick={e => { e.stopPropagation(); onClick(e); }} title={title} type="button"
+      onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
+      style={{ background: hov ? (danger ? "#fff0f0" : "#f1f1f1") : "none", color: danger ? "#d72c0d" : "#6d7175", border: "none", cursor: "pointer", padding: 4, borderRadius: 5, display: "flex", alignItems: "center", flexShrink: 0, transition: "background .15s" }}>
+      {children}
+    </button>
+  );
+}
+
+/* ─── SmallImagePicker ──────────────────────────────────────────────────── */
+function SmallImagePicker({ image, onPickFile, onRemove }: {
+  image: ProductImage | null;
+  onPickFile: (file: File) => void;
+  onRemove?: () => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  const [hov, setHov] = useState(false);
+  return (
+    <div style={{ position: "relative", width: 38, height: 38, flexShrink: 0 }}
+      onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}>
+      <button type="button" onClick={e => { e.stopPropagation(); ref.current?.click(); }}
+        style={{ width: 38, height: 38, borderRadius: 7, border: `1.5px ${image ? "solid" : "dashed"} ${image ? "#c9cccf" : "#b0b0b0"}`, background: image ? "transparent" : "#f9fafb", cursor: "pointer", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}>
+        {image ? (
+          <img src={image.url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        ) : (
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8c9196" strokeWidth="2">
+            <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>
+          </svg>
+        )}
+      </button>
+      {image && hov && (
+        <div style={{ position: "absolute", inset: 0, borderRadius: 7, background: "rgba(0,0,0,.45)", display: "flex", alignItems: "center", justifyContent: "center", gap: 3 }}>
+          <button type="button" onClick={e => { e.stopPropagation(); ref.current?.click(); }}
+            style={{ background: "rgba(255,255,255,.9)", border: "none", borderRadius: 4, padding: "2px 4px", cursor: "pointer", fontSize: 10, fontWeight: 700, color: "#303030" }} title="Change image">✎</button>
+          {onRemove && (
+            <button type="button" onClick={e => { e.stopPropagation(); onRemove(); }}
+              style={{ background: "rgba(255,60,60,.9)", border: "none", borderRadius: 4, padding: "2px 4px", cursor: "pointer", fontSize: 11, fontWeight: 700, color: "#fff" }} title="Remove">×</button>
+          )}
+        </div>
+      )}
+      <input ref={ref} type="file" accept=".png,.jpg,.jpeg" style={{ display: "none" }}
+        onChange={e => { const f = e.target.files?.[0]; if (f) { onPickFile(f); e.target.value = ""; } }} />
+    </div>
+  );
+}
+
+/* ─── OptionNameInput ────────────────────────────────────────────────────── */
+function OptionNameInput({ value, onChange, existingNames, hasError = false }: { value: string; onChange: (v: string) => void; existingNames: string[]; hasError?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [inputVal, setInputVal] = useState(value);
+  const [isEditing, setIsEditing] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const { rect, recalc } = useDropdownPosition(open, ref);
+
+  useEffect(() => {
+    if (!isEditing) setInputVal(value);
+  }, [value, isEditing]);
+
+  useEffect(() => {
+    const h = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+        setIsEditing(false);
+        setInputVal(value);
+      }
+    };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, [value]);
+
+  const available = PRESET_OPTION_NAMES.filter(n => !existingNames.includes(n));
+  const isCustom = value && !PRESET_OPTION_NAMES.includes(value);
+
+  const filtered = isEditing && inputVal.trim()
+    ? available.filter(n => n.toLowerCase().includes(inputVal.toLowerCase()))
+    : available;
+
+  const exactMatch = available.some(n => n.toLowerCase() === inputVal.trim().toLowerCase());
+  const showCreate = isEditing && inputVal.trim() !== "" && !exactMatch;
+
+  const openDrop = () => {
+    setIsEditing(false);
+    setInputVal(value);
+    recalc();
+    setOpen(true);
+  };
+
+  const select = (e: React.MouseEvent, name: string) => {
+    e.preventDefault();
+    onChange(name);
+    setInputVal(name);
+    setIsEditing(false);
+    setOpen(false);
+  };
+
+  const createNew = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const trimmed = inputVal.trim();
+    onChange(trimmed);
+    setInputVal(trimmed);
+    setIsEditing(false);
+    setOpen(false);
+  };
+
+  const hasItems = filtered.length > 0 || showCreate || (isCustom && !isEditing);
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <input
+        value={inputVal}
+        onChange={e => {
+          const v = e.target.value;
+          setInputVal(v);
+          setIsEditing(true);
+          if (!open) { recalc(); setOpen(true); }
+        }}
+        onFocus={() => { if (!open) openDrop(); }}
+        onClick={() => { if (!open) openDrop(); }}
+        onKeyDown={e => {
+          if (e.key === "Backspace" && value !== "") {
+            e.preventDefault();
+            onChange("");
+            setInputVal("");
+            setIsEditing(false);
+            if (!open) { recalc(); setOpen(true); }
+          }
+          if (e.key === "Enter") {
+            e.preventDefault();
+            if (showCreate) createNew(e as unknown as React.MouseEvent);
+            else if (filtered.length > 0) select(e as unknown as React.MouseEvent, filtered[0]);
+          }
+          if (e.key === "Escape") {
+            setOpen(false);
+            setIsEditing(false);
+            setInputVal(value);
+          }
+        }}
+        placeholder="e.g. Color, Size…"
+        style={{ ...S.inp, borderColor: open ? "#458fff" : hasError ? "#d72c0d" : "#c9cccf", boxShadow: open ? "0 0 0 2px rgba(69,143,255,.2)" : hasError ? "0 0 0 2px rgba(215,44,13,.15)" : "none", paddingRight: 32 }}
+      />
+      <div style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "#8c9196" }}>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9"/></svg>
+      </div>
+      {open && rect && hasItems && (
+        <div style={{ ...S.drop, top: rect.bottom + 4, left: rect.left, width: rect.width }}>
+          {isCustom && !isEditing && (
+            <button
+              onMouseDown={e => select(e, value)}
+              style={{ ...S.dropItem, background: "#f0f6ff", color: "#458fff" }}
+              onMouseEnter={e => (e.currentTarget.style.background = "#eef5ff")}
+              onMouseLeave={e => (e.currentTarget.style.background = "#f0f6ff")}>
+              <span style={{ width: 16, display: "inline-flex", flexShrink: 0 }}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>
+              </span>
+              {value}
+            </button>
+          )}
+          {filtered.map(name => (
+            <button key={name} onMouseDown={e => select(e, name)}
+              style={{ ...S.dropItem, background: value === name && !isEditing ? "#f0f6ff" : "none", color: value === name && !isEditing ? "#458fff" : "#303030" }}
+              onMouseEnter={e => (e.currentTarget.style.background = value === name && !isEditing ? "#eef5ff" : "#f6f6f7")}
+              onMouseLeave={e => (e.currentTarget.style.background = value === name && !isEditing ? "#f0f6ff" : "none")}>
+              <span style={{ width: 16, display: "inline-flex", flexShrink: 0 }}>
+                {value === name && !isEditing && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>}
+              </span>
+              {name}
+            </button>
+          ))}
+          {showCreate && (
+            <button onMouseDown={createNew}
+              style={{ ...S.dropItem, borderTop: filtered.length > 0 || (isCustom && !isEditing) ? "1px solid #f1f1f1" : "none" }}
+              onMouseEnter={e => (e.currentTarget.style.background = "#f6f6f7")}
+              onMouseLeave={e => (e.currentTarget.style.background = "none")}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: "#fff", background: "#458fff", borderRadius: 4, padding: "2px 6px", flexShrink: 0 }}>+ Create</span>
+              <span>"{inputVal.trim()}"</span>
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── OptionValuesEditor ─────────────────────────────────────────────────── */
+function OptionValuesEditor({ values, onChange, optionName = "", hasError = false }: { values: string[]; onChange: (v: string[]) => void; optionName?: string; hasError?: boolean }) {
+  const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [overIdx, setOverIdx] = useState<number | null>(null);
+  const list = values.length ? values : [""];
+  const lastIsFilled = list[list.length - 1]?.trim() !== "";
+
+  const usedSet = new Set(list.filter(Boolean));
+  const suggestions = (OPTION_SUGGESTIONS[optionName] || []).filter(s => !usedSet.has(s));
+
+  const addSuggestion = (s: string) => {
+    const filled = list.filter(Boolean);
+    onChange([...filled, s, ""]);
+  };
+
+  const update = (idx: number, val: string) => {
+    const next = [...list]; next[idx] = val;
+    if (idx === next.length - 1 && val.trim() !== "") next.push("");
+    onChange(next);
+  };
+  const remove = (idx: number) => {
+    if (list.length === 1) { onChange([""]); return; }
+    const next = list.filter((_, i) => i !== idx);
+    onChange(next);
+    setTimeout(() => inputRefs.current[Math.min(idx, next.length - 1)]?.focus(), 0);
+  };
+  const addRow = () => {
+    if (!lastIsFilled) return;
+    const next = [...list, ""];
+    onChange(next);
+    setTimeout(() => inputRefs.current[next.length - 1]?.focus(), 0);
+  };
+
+  return (
+    <div>
+      {suggestions.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: "#8c9196", marginBottom: 5, fontWeight: 500 }}>Suggested:</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+            {suggestions.map(s => (
+              <button key={s} type="button" onClick={() => addSuggestion(s)}
+                style={{ fontSize: 12, padding: "3px 10px", borderRadius: 99, border: "1px solid #c9cccf", background: "#f7f7f7", color: "#303030", cursor: "pointer", fontWeight: 500, transition: "background .12s" }}
+                onMouseEnter={e => { e.currentTarget.style.background = "#e8f0fe"; e.currentTarget.style.borderColor = "#458fff"; e.currentTarget.style.color = "#458fff"; }}
+                onMouseLeave={e => { e.currentTarget.style.background = "#f7f7f7"; e.currentTarget.style.borderColor = "#c9cccf"; e.currentTarget.style.color = "#303030"; }}>
+                + {s}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {list.map((val, idx) => {
+          const isFirstAndError = hasError && idx === 0;
+          return (
+            <div key={idx}>
+              <div draggable
+                onDragStart={e => { setDragIdx(idx); e.dataTransfer.effectAllowed = "move"; const g = document.createElement("div"); g.style.cssText = "position:fixed;top:-999px"; document.body.appendChild(g); e.dataTransfer.setDragImage(g, 0, 0); setTimeout(() => document.body.removeChild(g), 0); }}
+                onDragEnter={e => { e.preventDefault(); if (dragIdx !== null && idx !== dragIdx) setOverIdx(idx); }}
+                onDragOver={e => e.preventDefault()}
+                onDrop={e => { e.preventDefault(); if (dragIdx === null || dragIdx === idx) return; const n = [...list]; const [m] = n.splice(dragIdx, 1); n.splice(idx, 0, m); onChange(n); setDragIdx(null); setOverIdx(null); }}
+                onDragEnd={() => { setDragIdx(null); setOverIdx(null); }}
+                style={{ display: "flex", alignItems: "center", gap: 8, opacity: dragIdx === idx ? 0.4 : 1, background: overIdx === idx ? "#f0f6ff" : "transparent", borderRadius: 6 }}>
+                <DragHandle />
+                <input ref={el => { inputRefs.current[idx] = el; }} value={val}
+                  onChange={e => update(idx, e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") { e.preventDefault(); if (idx < list.length - 1) inputRefs.current[idx + 1]?.focus(); else if (val.trim()) addRow(); }
+                    if (e.key === "Backspace" && val === "" && list.length > 1) { e.preventDefault(); remove(idx); }
+                  }}
+                  placeholder={idx === 0 ? "e.g. Value 1…" : "Add value…"}
+                  style={{
+                    ...S.inp,
+                    borderColor: isFirstAndError ? "#d72c0d" : "#c9cccf",
+                    boxShadow: isFirstAndError ? "0 0 0 2px rgba(215,44,13,.15)" : "none",
+                  }} />
+                <button type="button" onClick={() => remove(idx)} style={{ background: "none", border: "none", cursor: "pointer", color: "#8c9196", flexShrink: 0, padding: 4, display: "flex" }}>
+                  <TrashIcon />
+                </button>
+              </div>
+              {isFirstAndError && (
+                <div style={{ fontSize: 12, color: "#d72c0d", marginTop: 4, paddingLeft: 24 }}>
+                  ⚠ Add at least one value.
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <button onClick={addRow} type="button" disabled={!lastIsFilled}
+        style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: lastIsFilled ? "pointer" : "default", color: lastIsFilled ? "#458fff" : "#c4c4c4", fontSize: 13, fontWeight: 500, marginTop: 10, padding: 0 }}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Add another value
+      </button>
+    </div>
+  );
+}
+
+const OptionNameInputValidated = OptionNameInput;
+function OptionValuesEditorValidated({ values, onChange, optionName, hasError }: { values: string[]; onChange: (v: string[]) => void; optionName?: string; hasError?: boolean }) {
+  return <OptionValuesEditor values={values} onChange={onChange} optionName={optionName} hasError={hasError} />;
+}
+
+/* ─── EditOptionModal ────────────────────────────────────────────────────── */
+function EditOptionModal({ option, existingNames, onSave, onCancel }: { option: VariantOption; existingNames: string[]; onSave: (o: VariantOption) => void; onCancel: () => void }) {
+  const [name, setName] = useState(option.name);
+  const [values, setValues] = useState<string[]>(option.values.length ? option.values : [""]);
+  const [nameError, setNameError] = useState("");
+  const [valuesError, setValuesError] = useState(false);
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", zIndex: 10000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+      onClick={e => { if (e.target === e.currentTarget) onCancel(); }}>
+      <div style={{ background: "#fff", borderRadius: 12, padding: 24, width: "100%", maxWidth: 480, maxHeight: "90vh", overflowY: "auto", boxShadow: "0 8px 40px rgba(0,0,0,.18)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 20 }}>
+          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>تعديل الخيار</h3>
+          <button onClick={onCancel} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 20, color: "#8c9196" }}>×</button>
+        </div>
+        <div style={{ marginBottom: 16, padding: 14, background: "#f9fafb", border: "1px solid #e3e3e3", borderRadius: 8 }}>
+          <label style={S.label}>Option name</label>
+          <OptionNameInputValidated value={name} onChange={v => { setName(v); if (nameError) setNameError(""); }} existingNames={existingNames.filter(n => n !== option.name)} hasError={!!nameError} />
+          {nameError && <div style={{ fontSize: 12, color: "#d72c0d", marginTop: 5 }}>⚠ {nameError}</div>}
+          <div style={{ marginTop: 12 }}>
+            <label style={S.label}>Option values</label>
+            <OptionValuesEditorValidated values={values} onChange={v => { setValues(v); if (valuesError) setValuesError(false); }} optionName={name} hasError={valuesError} />
+          </div>
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button onClick={onCancel} style={{ padding: "8px 18px", fontSize: 13, borderRadius: 7, cursor: "pointer", background: "#fff", color: "#303030", border: "1px solid #c9cccf" }}>Cancel</button>
+          <button onClick={() => {
+            let hasErr = false;
+            if (!name.trim()) { setNameError("Please select an option name. Must be 20 letters max."); hasErr = true; }
+            else if (name.trim().length > 20) { setNameError("Must be 20 letters max."); hasErr = true; }
+            const cleaned = values.map(v => v.trim()).filter(Boolean);
+            if (!cleaned.length) { setValuesError(true); hasErr = true; }
+            if (hasErr) return;
+            onSave({ name: name.trim(), values: cleaned });
+          }} style={{ padding: "8px 18px", fontSize: 13, borderRadius: 7, cursor: "pointer", background: "#303030", color: "#fff", border: "none", fontWeight: 600 }}>Apply</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── AddOptionForm ──────────────────────────────────────────────────────── */
+function AddOptionForm({ onDone, onCancel, existingNames }: { onDone: (o: VariantOption) => void; onCancel: () => void; existingNames: string[] }) {
+  const [name, setName] = useState("");
+  const [values, setValues] = useState<string[]>([""]);
+  const [nameError, setNameError] = useState("");
+  const [valuesError, setValuesError] = useState(false);
+
+  return (
+    <div style={{ background: "#f9fafb", border: "1px solid #e3e3e3", borderRadius: 8, padding: 14 }}>
+      <div style={{ marginBottom: 14 }}>
+        <label style={S.label}>Option name</label>
+        <OptionNameInputValidated value={name} onChange={v => { setName(v); if (nameError) setNameError(""); }} existingNames={existingNames} hasError={!!nameError} />
+        {nameError && <div style={{ fontSize: 12, color: "#d72c0d", marginTop: 5 }}>⚠ {nameError}</div>}
+      </div>
+      <div style={{ marginBottom: 14 }}>
+        <label style={S.label}>Option values</label>
+        <OptionValuesEditorValidated values={values} onChange={v => { setValues(v); if (valuesError) setValuesError(false); }} optionName={name} hasError={valuesError} />
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between" }}>
+        <button onClick={onCancel} style={{ fontSize: 13, border: "none", background: "none", cursor: "pointer", fontWeight: 500, color: "#d72c0d" }}>Cancel</button>
+        <button onClick={() => {
+          let hasErr = false;
+          if (!name.trim()) { setNameError("Please select an option name. Must be 20 letters max."); hasErr = true; }
+          else if (name.trim().length > 20) { setNameError("Must be 20 letters max."); hasErr = true; }
+          const cleaned = values.map(v => v.trim()).filter(Boolean);
+          if (!cleaned.length) { setValuesError(true); hasErr = true; }
+          if (hasErr) return;
+          onDone({ name: name.trim(), values: cleaned });
+        }} style={{ padding: "6px 16px", fontSize: 13, fontWeight: 600, borderRadius: 7, cursor: "pointer", background: "#303030", color: "#fff", border: "none" }}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+/* ─── ApplyAllInput ──────────────────────────────────────────────────────── */
+function ApplyAllInput({ value, onChange, onApply, type = "text", prefix }: {
+  value: string; onChange: (v: string) => void; onApply: () => void;
+  type?: string; prefix?: string;
+}) {
+  const isEmpty = value.trim() === "";
+  return (
+    <div style={{ display: "flex", alignItems: "stretch", border: "1px solid #c9cccf", borderRadius: 6, overflow: "hidden", background: "#fff" }}>
+      {prefix && (
+        <span style={{ padding: "0 9px", display: "flex", alignItems: "center", fontSize: 12, color: "#6d7175", borderRight: "1px solid #e3e3e3", background: "#f9fafb", whiteSpace: "nowrap" }}>{prefix}</span>
+      )}
+      <input value={value} onChange={e => onChange(e.target.value)} type={type}
+        onKeyDown={e => { if (e.key === "Enter" && !isEmpty) onApply(); }}
+        onFocus={e => e.currentTarget.select()}
+        placeholder="—" min={type === "number" ? "0" : undefined}
+        style={{ flex: 1, padding: "6px 8px", fontSize: 13, border: "none", outline: "none", background: "transparent", color: "#303030", width: 0, minWidth: 0 }} />
+      <button type="button" onClick={() => { if (!isEmpty) onApply(); }} disabled={isEmpty}
+        style={{ padding: "0 10px", fontSize: 12, fontWeight: 600, color: isEmpty ? "#c4c4c4" : "#458fff", background: "none", border: "none", borderLeft: "1px solid #e3e3e3", cursor: isEmpty ? "default" : "pointer", whiteSpace: "nowrap", transition: "color .15s" }}>
+        Apply all
+      </button>
+    </div>
+  );
+}
+
+/* ─── MixedCell ── */
+function MixedCell({ prefix }: { prefix?: string }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", border: "1px solid #e8e8e8", borderRadius: 7, overflow: "hidden", background: "#fafafa", height: 31 }}>
+      {prefix && (
+        <span style={{ padding: "0 7px", fontSize: 12, color: "#c4c4c4", borderRight: "1px solid #e8e8e8", background: "#f3f3f3", whiteSpace: "nowrap", lineHeight: "31px" }}>{prefix}</span>
+      )}
+      <span style={{ flex: 1, padding: "0 8px", fontSize: 11, color: "#bbb", fontStyle: "italic" }}>Mixed</span>
+    </div>
+  );
+}
+
+/* ─── VariantTableModal ─────────────────────────────────────────────────── */
+function VariantTableModal({ title, rows: initRows, onSave, onCancel }: {
+  title: string; rows: VariantRow[];
+  onSave: (rows: VariantRow[]) => void; onCancel: () => void;
+}) {
+  const [rows, setRows] = useState<VariantRow[]>(initRows.map(r => ({ ...r })));
+  const [applyPrice, setApplyPrice] = useState("");
+  const [applySale, setApplySale] = useState("");
+  const [applyQty, setApplyQty] = useState("");
+
+  const updRow = (idx: number, field: keyof VariantRow, val: unknown) =>
+    setRows(prev => { const n = [...prev]; n[idx] = { ...n[idx], [field]: val }; return n; });
+
+  const applyAll = (field: "price" | "salePrice" | "quantity", rawVal: string) => {
+    setRows(prev => prev.map(r => ({ ...r, [field]: field === "quantity" ? (parseInt(rawVal) || 0) : rawVal })));
+  };
+
+  const colHdr: React.CSSProperties = { fontSize: 11, fontWeight: 700, color: "#6d7175", padding: "7px 10px", background: "#f9fafb", borderBottom: "1px solid #e3e3e3", textAlign: "left", whiteSpace: "nowrap", textTransform: "uppercase", letterSpacing: "0.04em" };
+  const applyHdr: React.CSSProperties = { padding: "5px 8px", background: "#f9fafb", borderBottom: "1px solid #ddd" };
+  const cell: React.CSSProperties = { padding: "5px 8px", borderBottom: "1px solid #f1f1f1", verticalAlign: "middle" };
+
+  const priceCell = (val: string, onChange: (v: string) => void) => (
+    <div style={{ display: "flex", alignItems: "center", border: "1px solid #c9cccf", borderRadius: 6, overflow: "hidden" }}>
+      <span style={{ padding: "0 9px", fontSize: 12, color: "#6d7175", borderRight: "1px solid #e3e3e3", background: "#f9fafb", whiteSpace: "nowrap", lineHeight: "32px" }}>EGP</span>
+      <input value={val} onChange={e => onChange(e.target.value)} type="number" min="0" placeholder="—"
+        onFocus={e => e.currentTarget.select()}
+        style={{ flex: 1, padding: "6px 8px", fontSize: 13, border: "none", outline: "none", background: "transparent", color: "#303030", minWidth: 0, width: 0 }} />
+    </div>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 10000, background: "rgba(0,0,0,.5)", display: "flex", alignItems: "flex-start", justifyContent: "center", overflowY: "auto", padding: "40px 16px" }}
+      onClick={e => { if (e.target === e.currentTarget) onCancel(); }}>
+      <div style={{ background: "#fff", borderRadius: 12, width: "100%", maxWidth: 820, boxShadow: "0 8px 40px rgba(0,0,0,.18)", overflow: "hidden" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 16px", borderBottom: "1px solid #e3e3e3" }}>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#303030" }}>{title}</h3>
+          <button onClick={onCancel} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 22, color: "#8c9196", lineHeight: 1, padding: "0 2px" }}>×</button>
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr>
+                <th style={{ ...colHdr, minWidth: 110 }}>Options</th>
+                <th style={{ ...colHdr, minWidth: 140 }}>Price</th>
+                <th style={{ ...colHdr, minWidth: 140 }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    Original Price
+                    <button onClick={() => setRows(prev => prev.map(r => ({ ...r, salePrice: "" })))}
+                      style={{ fontSize: 11, color: "#458fff", background: "none", border: "none", cursor: "pointer", fontWeight: 500, padding: "0 2px" }}>Reset</button>
+                  </span>
+                </th>
+                <th style={{ ...colHdr, minWidth: 100 }}>QTY</th>
+              </tr>
+              <tr>
+                <td style={{ ...applyHdr, fontSize: 11, color: "#8c9196", fontStyle: "italic", paddingLeft: 10 }}>Apply to all</td>
+                <td style={applyHdr}>
+                  <ApplyAllInput prefix="EGP" value={applyPrice} onChange={setApplyPrice}
+                    onApply={() => { applyAll("price", applyPrice); setApplyPrice(""); }} />
+                </td>
+                <td style={applyHdr}>
+                  <ApplyAllInput prefix="EGP" value={applySale} onChange={setApplySale}
+                    onApply={() => { applyAll("salePrice", applySale); setApplySale(""); }} />
+                </td>
+                <td style={applyHdr}>
+                  <ApplyAllInput value={applyQty} onChange={setApplyQty} type="number"
+                    onApply={() => { applyAll("quantity", applyQty); setApplyQty(""); }} />
+                </td>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, idx) => (
+                <tr key={idx}
+                  onMouseEnter={e => (e.currentTarget.style.background = "#f9fafb")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "#fff")}>
+                  <td style={{ ...cell, fontWeight: 600, fontSize: 12, color: "#303030" }}>{row.combination.join(" / ")}</td>
+                  <td style={cell}>{priceCell(row.price, v => updRow(idx, "price", v))}</td>
+                  <td style={cell}>{priceCell(row.salePrice, v => updRow(idx, "salePrice", v))}</td>
+                  <td style={cell}>
+                    <input value={row.quantity} onChange={e => updRow(idx, "quantity", parseInt(e.target.value) || 0)} type="number" min="0" placeholder="0"
+                      onFocus={e => e.currentTarget.select()}
+                      style={{ display: "block", width: "100%", border: "1px solid #c9cccf", borderRadius: 6, fontSize: 13, padding: "6px 8px", outline: "none", color: "#303030", background: "#fff", boxSizing: "border-box" }} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ display: "flex", gap: 8, padding: "12px 16px", borderTop: "1px solid #e3e3e3" }}>
+          <button onClick={() => onSave(rows)} style={{ padding: "8px 20px", fontSize: 13, fontWeight: 600, borderRadius: 7, cursor: "pointer", background: "#1a9c3e", color: "#fff", border: "none" }}>Save changes</button>
+          <button onClick={onCancel} style={{ padding: "8px 16px", fontSize: 13, borderRadius: 7, cursor: "pointer", background: "#fff", color: "#303030", border: "1px solid #c9cccf" }}>Discard</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BulkEditModal({ variants, onSave, onCancel }:
+  { variants: VariantRow[]; onSave: (rows: VariantRow[]) => void; onCancel: () => void }) {
+  return <VariantTableModal title="Bulk Edit" rows={variants} onSave={onSave} onCancel={onCancel} />;
+}
+
+function EditSelectedModal({ selectedRows, onSave, onCancel }: {
+  selectedRows: VariantRow[];
+  onSave: (rows: VariantRow[]) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <VariantTableModal
+      title={`Edit selected (${selectedRows.length})`}
+      rows={selectedRows}
+      onSave={onSave}
+      onCancel={onCancel}
+    />
+  );
+}
+
+/* ─── VariantEditModal ──────────────────────────────────────────────────── */
+function VariantEditModal({ variant, onSave, onCancel, onPickImage }:
+  { variant: VariantRow; onSave: (row: VariantRow) => void; onCancel: () => void; onPickImage: (file: File, cb: (img: ProductImage) => void) => void }) {
+  const [row, setRow] = useState<VariantRow>({ ...variant });
+  const upd = (field: keyof VariantRow, val: unknown) => setRow(r => ({ ...r, [field]: val }));
+
+  const smallPriceInput = (val: string, onChange: (v: string) => void, placeholder = "0.00") => (
+    <div style={{ display: "flex", alignItems: "center", border: "1px solid #c9cccf", borderRadius: 7, overflow: "hidden" }}>
+      <span style={{ padding: "0 8px", fontSize: 12, color: "#6d7175", borderRight: "1px solid #e3e3e3", background: "#f9fafb", whiteSpace: "nowrap" }}>ج.م</span>
+      <input value={val} onChange={e => onChange(e.target.value)} type="number" min="0" placeholder={placeholder}
+        style={{ flex: 1, padding: "6px 8px", fontSize: 13, border: "none", outline: "none", background: "transparent", color: "#303030" }} />
+    </div>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 10000, background: "rgba(0,0,0,.45)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+      onClick={e => { if (e.target === e.currentTarget) onCancel(); }}>
+      <div style={{ background: "#fff", borderRadius: 12, padding: 24, width: "100%", maxWidth: 440, boxShadow: "0 8px 40px rgba(0,0,0,.18)", direction: "rtl" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}>
+          <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700 }}>تعديل: {row.combination.join(" / ")}</h3>
+          <button onClick={onCancel} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 20, color: "#8c9196" }}>×</button>
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={S.label}>الصورة</label>
+          <SmallImagePicker image={row.image}
+            onPickFile={f => onPickImage(f, img => upd("image", img))}
+            onRemove={() => upd("image", null)} />
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={S.label}>السعر</label>
+          {smallPriceInput(row.price, v => upd("price", v))}
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={S.label}>السعر الأصلي (قبل الخصم)</label>
+          {smallPriceInput(row.salePrice, v => upd("salePrice", v), "السعر الأصلي")}
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={S.label}>الكمية</label>
+          <input type="number" min="0" value={row.quantity} onChange={e => upd("quantity", parseInt(e.target.value) || 0)}
+            placeholder="0"
+            style={{ ...S.inp, fontSize: 13, width: 100 }} />
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={S.label}>تعريف</label>
+          <input value={row.sku} onChange={e => upd("sku", e.target.value)} style={S.inp} placeholder="-" />
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer", fontWeight: 600, color: "#303030" }}>
+            <Toggle checked={row.active} onChange={v => upd("active", v)} /> نشط
+          </label>
+        </div>
+        <div style={{ display: "flex", gap: 8, paddingTop: 12, borderTop: "1px solid #f1f1f1" }}>
+          <button onClick={() => onSave(row)} style={{ padding: "8px 20px", fontSize: 13, fontWeight: 600, borderRadius: 7, cursor: "pointer", background: "#303030", color: "#fff", border: "none" }}>حفظ</button>
+          <button onClick={onCancel} style={{ padding: "8px 16px", fontSize: 13, borderRadius: 7, cursor: "pointer", background: "#fff", color: "#303030", border: "1px solid #c9cccf" }}>إلغاء</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── VariantsTable ──────────────────────────────────────────────────────── */
+function VariantsTable({ variants, options, onChange, onAddImage }:
+  { variants: VariantRow[]; options: VariantOption[]; onChange: (rows: VariantRow[]) => void; onAddImage: (file: File, cb: (img: ProductImage) => void) => void }) {
+  const [showBulk, setShowBulk] = useState(false);
+  const [editingIdx, setEditingIdx] = useState<number | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [showEditSelected, setShowEditSelected] = useState(false);
+
+  const isGrouped = options.length >= 2;
+
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
+  const toggleCollapse = (key: string) =>
+    setExpandedKeys(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
+  const isExpanded = (key: string) => expandedKeys.has(key);
+
+  const [groupImages, setGroupImages] = useState<Record<string, ProductImage | null>>({});
+
+  const groupMap = new Map<string, number[]>();
+  if (isGrouped) {
+    variants.forEach((row, idx) => {
+      const key = row.combination[0] ?? "";
+      if (!groupMap.has(key)) groupMap.set(key, []);
+      groupMap.get(key)!.push(idx);
+    });
+  }
+
+  const allChecked = selected.size === variants.length && variants.length > 0;
+  const toggleAll = () => setSelected(allChecked ? new Set() : new Set(variants.map((_, i) => i)));
+  const toggleOne = (idx: number) => setSelected(prev => { const n = new Set(prev); n.has(idx) ? n.delete(idx) : n.add(idx); return n; });
+
+  const updateRow = (idx: number, field: keyof VariantRow, val: unknown) => {
+    const next = [...variants]; next[idx] = { ...next[idx], [field]: val }; onChange(next);
+  };
+
+  const applyToIndices = (indices: number[], field: keyof VariantRow, val: unknown) =>
+    onChange(variants.map((r, i) => (indices.includes(i) ? { ...r, [field]: val } : r)));
+
+  const [groupValues, setGroupValues] = useState<Record<string, { price: string; salePrice: string; qty: string; sku: string }>>({});
+  const getGV = (key: string) => {
+    const g = groupValues[key];
+    return { price: g?.price ?? "", salePrice: g?.salePrice ?? "", qty: g?.qty ?? "", sku: g?.sku ?? "" };
+  };
+  const setGV = (key: string, field: "price" | "salePrice" | "qty" | "sku", val: string) =>
+    setGroupValues(prev => ({ ...prev, [key]: { ...getGV(key), [field]: val } }));
+
+  const groupAllActive = (indices: number[]): boolean => indices.every(i => variants[i].active);
+
+  const colHdr: React.CSSProperties = { fontSize: 11, fontWeight: 700, color: "#6d7175", padding: "10px 10px", background: "#f9fafb", borderBottom: "1px solid #e3e3e3", textAlign: "left", whiteSpace: "nowrap", textTransform: "uppercase", letterSpacing: "0.04em" };
+  const cell: React.CSSProperties = { padding: "10px 5px", borderBottom: "1px solid #f1f1f1", verticalAlign: "middle" };
+
+  const priceCellInput = (val: string, onChangeFn: (v: string) => void) => (
+    <div style={{ display: "flex", alignItems: "center", border: "1px solid #c9cccf", borderRadius: 7, overflow: "hidden" }}>
+      <span style={{ padding: "8px 8px", fontSize: 12, color: "#6d7175", borderRight: "1px solid #e3e3e3", background: "#fff", whiteSpace: "nowrap" }}>ج.م</span>
+      <input value={val} onChange={e => onChangeFn(e.target.value)} type="number" min="0" placeholder="—"
+        onFocus={e => e.currentTarget.select()}
+        style={{ flex: 1, padding: "6px 8px", fontSize: 13, border: "none", outline: "none", background: "#fff", color: "#303030", width: 65, minWidth: 65 }} />
+    </div>
+  );
+
+  const renderRow = (row: VariantRow, idx: number, displayName: string, indent: boolean) => {
+    return (
+      <tr key={row.combination.join("|")} style={{ background: selected.has(idx) ? "#f0f6ff" : "#fff", transition: "background .1s" }}
+        onMouseEnter={e => { if (!selected.has(idx)) e.currentTarget.style.background = "#f8f9fa"; }}
+        onMouseLeave={e => { e.currentTarget.style.background = selected.has(idx) ? "#f0f6ff" : "#fff"; }}>
+        <td style={{ ...cell, padding: "8px 12px" }} onClick={e => e.stopPropagation()}>
+          <input type="checkbox" checked={selected.has(idx)} onChange={() => toggleOne(idx)} style={{ cursor: "pointer", width: 15, height: 15 }} />
+        </td>
+        <td style={cell} onClick={e => e.stopPropagation()}>
+          <SmallImagePicker image={row.image}
+            onPickFile={f => onAddImage(f, img => updateRow(idx, "image", img))}
+            onRemove={() => updateRow(idx, "image", null)} />
+        </td>
+        <td style={{ ...cell, fontSize: indent ? 13 : 14, fontWeight: indent ? 500 : 600, color: indent ? "#458fff" : "#303030", paddingLeft: indent ? 15 : 10 }}>
+          {displayName}
+        </td>
+        <td style={cell} onClick={e => e.stopPropagation()}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {priceCellInput(row.price, v => updateRow(idx, "price", v))}
+          </div>
+        </td>
+        <td style={cell} onClick={e => e.stopPropagation()}>{priceCellInput(row.salePrice, v => updateRow(idx, "salePrice", v))}</td>
+        <td style={cell} onClick={e => e.stopPropagation()}>
+          {/* Quantity: placeholder 0 */}
+          <input value={row.quantity} type="number" min="0" placeholder="0"
+            onChange={e => updateRow(idx, "quantity", parseInt(e.target.value) || 0)}
+            onFocus={e => e.currentTarget.select()}
+            style={{ ...S.inp, fontSize: 13, width: 70, textAlign: "center" }} />
+        </td>
+        <td style={cell} onClick={e => e.stopPropagation()}>
+          {/* SKU: placeholder - */}
+          <input value={row.sku} onChange={e => updateRow(idx, "sku", e.target.value)} style={{ ...S.inp, fontSize: 13 }} placeholder="-" />
+        </td>
+        <td style={{ ...cell, textAlign: "center" }} onClick={e => e.stopPropagation()}>
+          <Toggle checked={row.active} onChange={v => updateRow(idx, "active", v)} />
+        </td>
+        <td style={{ ...cell, textAlign: "center" }}>
+          <IconBtn onClick={() => setEditingIdx(idx)} title="تعديل"><EditIcon /></IconBtn>
+        </td>
+      </tr>
+    );
+  };
+
+  const renderGroupRow = (key: string, indices: number[]) => {
+    const expanded = isExpanded(key);
+    const groupActive = groupAllActive(indices);
+    const groupSelected = indices.every(i => selected.has(i));
+    return (
+      <tr key={`g-${key}`} style={{ background: "#fafbfc" }}>
+        <td style={{ ...cell, padding: "10px 12px" }} onClick={e => e.stopPropagation()}>
+          <input type="checkbox" checked={groupSelected} onChange={() => {
+            setSelected(prev => {
+              const n = new Set(prev);
+              const allSel = indices.every(i => n.has(i));
+              indices.forEach(i => (allSel ? n.delete(i) : n.add(i)));
+              return n;
+            });
+          }} style={{ cursor: "pointer", width: 15, height: 15 }} />
+        </td>
+        <td style={cell} onClick={e => e.stopPropagation()}>
+          <SmallImagePicker image={groupImages[key] ?? null}
+            onPickFile={f => onAddImage(f, img => { setGroupImages(prev => ({ ...prev, [key]: img })); applyToIndices(indices, "image", img); })}
+            onRemove={() => { setGroupImages(prev => ({ ...prev, [key]: null })); applyToIndices(indices, "image", null); }} />
+        </td>
+        <td style={cell}>
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            <span style={{ fontSize: 14, fontWeight: 700, color: "#303030" }}>{key || "—"}</span>
+            <span style={{ fontSize: 11, color: "#8c9196" }}>{indices.length} variants</span>
+          </div>
+        </td>
+        <td style={cell} onClick={e => e.stopPropagation()}>
+          {priceCellInput(getGV(key).price, v => { setGV(key, "price", v); applyToIndices(indices, "price", v); })}
+        </td>
+        <td style={cell} onClick={e => e.stopPropagation()}>
+          {priceCellInput(getGV(key).salePrice, v => { setGV(key, "salePrice", v); applyToIndices(indices, "salePrice", v); })}
+        </td>
+        <td style={cell} onClick={e => e.stopPropagation()}>
+          {/* Group quantity: placeholder 0 */}
+          <input value={getGV(key).qty} type="number" min="0" placeholder="0"
+            onChange={e => { setGV(key, "qty", e.target.value); applyToIndices(indices, "quantity", parseInt(e.target.value) || 0); }}
+            onFocus={e => e.currentTarget.select()}
+            style={{ ...S.inp, fontSize: 13, width: 70, textAlign: "center" }} />
+        </td>
+        <td style={cell} onClick={e => e.stopPropagation()}>
+          {/* Group SKU: placeholder - */}
+          <input value={getGV(key).sku} placeholder="-"
+            onChange={e => { setGV(key, "sku", e.target.value); applyToIndices(indices, "sku", e.target.value); }}
+            style={{ ...S.inp, fontSize: 13 }} />
+        </td>
+        <td style={{ ...cell, textAlign: "center" }} onClick={e => e.stopPropagation()}>
+          <Toggle checked={groupActive} onChange={v => applyToIndices(indices, "active", v)} />
+        </td>
+        <td style={{ ...cell, textAlign: "center" }}>
+          <button type="button" onClick={() => toggleCollapse(key)}
+            style={{ background: "none", border: "none", cursor: "pointer", color: "#6d7175", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto" }}>
+            <Chevron up={expanded} />
+          </button>
+        </td>
+      </tr>
+    );
+  };
+
+  const bodyRows: React.ReactNode[] = isGrouped
+    ? Array.from(groupMap.entries()).flatMap(([key, indices]) => {
+        const rows: React.ReactNode[] = [renderGroupRow(key, indices)];
+        if (isExpanded(key)) {
+          indices.forEach(idx => {
+            const row = variants[idx];
+            rows.push(renderRow(row, idx, row.combination.slice(1).join(" / ") || "—", true));
+          });
+        }
+        return rows;
+      })
+    : variants.map((row, idx) => renderRow(row, idx, row.combination.join("، ") || "—", false));
+
+  return (
+    <>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#303030" }}>{variants.length} Variants</span>
+          {selected.size > 0 && (
+            <button onClick={() => setShowEditSelected(true)}
+              style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, cursor: "pointer", borderRadius: 7, padding: "4px 10px", fontWeight: 600, background: "#303030", color: "#fff", border: "none" }}>
+              <EditIcon /> Edit selected ({selected.size})
+            </button>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button onClick={() => setShowBulk(true)}
+            style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 13, cursor: "pointer", borderRadius: 7, padding: "5px 10px", fontWeight: 500, border: "none", background: "none", color: "#458fff" }}>
+            <EditIcon /> Bulk Edit
+          </button>
+        </div>
+      </div>
+
+      <div style={{ border: "1px solid #e3e3e3", borderRadius: 10, overflow: "hidden" }}>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr>
+                <th style={{ ...colHdr, width: 36, padding: "10px 12px" }}>
+                  <input type="checkbox" checked={allChecked} onChange={toggleAll} style={{ cursor: "pointer", width: 15, height: 15 }} />
+                </th>
+                <th style={{ ...colHdr, width: 44 }}></th>
+                <th style={colHdr}>اسم</th>
+                <th style={colHdr}>سعر</th>
+                <th style={colHdr}>السعر الأصلي</th>
+                <th style={colHdr}>الكمية</th>
+                <th style={colHdr}>تعريف</th>
+                <th style={{ ...colHdr, textAlign: "center" }}>نشط</th>
+                <th style={{ ...colHdr, width: 40 }}></th>
+              </tr>
+            </thead>
+            <tbody>{bodyRows}</tbody>
+          </table>
+        </div>
+      </div>
+
+      {showBulk && (
+        <BulkEditModal variants={variants}
+          onSave={rows => { onChange(rows); setShowBulk(false); }}
+          onCancel={() => setShowBulk(false)} />
+      )}
+      {editingIdx !== null && (
+        <VariantEditModal variant={variants[editingIdx]}
+          onSave={row => { onChange(variants.map((v, i) => i === editingIdx ? row : v)); setEditingIdx(null); }}
+          onCancel={() => setEditingIdx(null)}
+          onPickImage={onAddImage} />
+      )}
+      {showEditSelected && (
+        <EditSelectedModal
+          selectedRows={variants.filter((_, i) => selected.has(i))}
+          onSave={rows => {
+            const selectedArr = [...selected].sort((a, b) => a - b);
+            const next = [...variants];
+            rows.forEach((r, ri) => { next[selectedArr[ri]] = r; });
+            onChange(next);
+            setShowEditSelected(false);
+            setSelected(new Set());
+          }}
+          onCancel={() => setShowEditSelected(false)}
+        />
+      )}
+    </>
+  );
+}
+
+/* ─── VariantsSection ────────────────────────────────────────────────────── */
+function VariantsSection({ options, variants, onOptionsChange, onVariantsChange, onAddImage, allImages }:
+  { options: VariantOption[]; variants: VariantRow[]; allImages: ProductImage[]; onOptionsChange: (opts: VariantOption[], vars: VariantRow[]) => void; onVariantsChange: (vars: VariantRow[]) => void; onAddImage: (file: File, cb: (img: ProductImage) => void) => void }) {
+  const [addingNew, setAddingNew] = useState(false);
+  const [editingIdx, setEditingIdx] = useState<number | null>(null);
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [overDragIdx, setOverDragIdx] = useState<number | null>(null);
+  const setOptions = (next: VariantOption[]) => onOptionsChange(next, syncVariants(next, variants));
+  const removeOption = (idx: number) => setOptions(options.filter((_, i) => i !== idx));
+  const handleEditSave = (opt: VariantOption) => {
+    if (editingIdx === null) return;
+    const next = [...options]; next[editingIdx] = opt;
+    setOptions(next); setEditingIdx(null);
+  };
+  const canAddMore = options.length < PRESET_OPTION_NAMES.length;
+
+  return (
+    <div>
+      <span style={S.sectionTitle}>Options & Variants</span>
+      <div style={{ border: "1px solid #e3e3e3", borderRadius: 10, marginBottom: 16, overflow: "visible", position: "relative" }}>
+        {options.length > 0 && (
+          <>
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#6d7175", padding: "10px 16px", background: "#f9fafb", borderBottom: "1px solid #e3e3e3", textTransform: "uppercase", letterSpacing: "0.04em", borderRadius: "10px 10px 0 0" }}>Options</div>
+            {options.map((opt, idx) => (
+              <div key={opt.name || `opt-${idx}`} draggable
+                onDragStart={e => { setDragIdx(idx); e.dataTransfer.effectAllowed = "move"; const g = document.createElement("div"); g.style.cssText = "position:fixed;top:-999px"; document.body.appendChild(g); e.dataTransfer.setDragImage(g, 0, 0); setTimeout(() => document.body.removeChild(g), 0); }}
+                onDragEnter={e => { e.preventDefault(); if (dragIdx !== null && idx !== dragIdx) setOverDragIdx(idx); }}
+                onDragOver={e => e.preventDefault()}
+                onDrop={e => { e.preventDefault(); if (dragIdx === null || dragIdx === idx) return; const next = [...options]; const [m] = next.splice(dragIdx, 1); next.splice(idx, 0, m); setOptions(next); setDragIdx(null); setOverDragIdx(null); }}
+                onDragEnd={() => { setDragIdx(null); setOverDragIdx(null); }}
+                onClick={() => setEditingIdx(idx)}
+                style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderTop: idx > 0 ? "1px solid #f1f1f1" : "none", opacity: dragIdx === idx ? 0.4 : 1, background: overDragIdx === idx ? "#f0f6ff" : "#fff", cursor: "pointer", transition: "background .15s" }}
+                onMouseEnter={e => { if (dragIdx === null) e.currentTarget.style.background = "#f8f9fa"; }}
+                onMouseLeave={e => { if (overDragIdx !== idx) e.currentTarget.style.background = "#fff"; }}>
+                <span onClick={e => e.stopPropagation()}><DragHandle /></span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: "#303030", minWidth: 52, flexShrink: 0 }}>{opt.name || "—"}</span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 5, flex: 1 }}>
+                  {opt.values.filter(Boolean).map((v) => (
+                    <span key={v} style={{ padding: "3px 10px", fontSize: 12, fontWeight: 500, borderRadius: 99, border: "1px solid #d9d9d9", color: "#303030", background: "#f7f7f7" }}>{v}</span>
+                  ))}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 2, flexShrink: 0 }} onClick={e => e.stopPropagation()}>
+                  <IconBtn onClick={e => { e.stopPropagation(); setEditingIdx(idx); }} title="تعديل"><EditIcon /></IconBtn>
+                  <IconBtn onClick={e => { e.stopPropagation(); removeOption(idx); }} danger title="حذف"><TrashIcon /></IconBtn>
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+        {addingNew && (
+          <div style={{ padding: 14, borderTop: options.length > 0 ? "1px solid #e3e3e3" : "none" }}>
+            <AddOptionForm
+              onDone={opt => { setOptions([...options, opt]); setAddingNew(false); }}
+              onCancel={() => setAddingNew(false)}
+              existingNames={options.map(o => o.name)}
+            />
+          </div>
+        )}
+        {!addingNew && canAddMore && (
+          <div style={{ padding: "10px 16px", background: options.length > 0 ? "#fafafa" : "#fff", borderTop: options.length > 0 ? "1px solid #f1f1f1" : "none", borderRadius: options.length > 0 ? "0 0 10px 10px" : 10 }}>
+            <button onClick={() => setAddingNew(true)} style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", color: "#458fff", fontSize: 13, fontWeight: 500, padding: 0 }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              أضف خيارًا آخر
+            </button>
+          </div>
+        )}
+      </div>
+      {variants.length > 0 && (
+        <VariantsTable
+          key={options.map(o => o.name).join("|")}
+          variants={variants} options={options}
+          onChange={onVariantsChange} onAddImage={onAddImage} />
+      )}
+      {editingIdx !== null && (
+        <EditOptionModal option={options[editingIdx]} existingNames={options.map(o => o.name)}
+          onSave={handleEditSave} onCancel={() => setEditingIdx(null)} />
+      )}
+    </div>
+  );
+}
+
+/* ─── TagsInput ──────────────────────────────────────────────────────────── */
+function TagsInput({ tags, onChange, localAllTags, onLocalAllTagsChange }:
+  { tags: Tag[]; onChange: (tags: Tag[]) => void; localAllTags: Tag[]; onLocalAllTagsChange: (tags: Tag[]) => void }) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const { rect, recalc } = useDropdownPosition(open, ref);
+
+  useEffect(() => {
+    const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) { setOpen(false); setQuery(""); } };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
+
+  const selectedIds = new Set(tags.map(t => t.id));
+  const filtered = localAllTags.filter(t => !selectedIds.has(t.id) && (!query || t.name.toLowerCase().includes(query.toLowerCase())));
+  const showCreate = query.trim() !== "" && !localAllTags.find(t => t.name.toLowerCase() === query.trim().toLowerCase());
+  const openDrop = () => { recalc(); setOpen(true); };
+
+  const addTag = (e: React.MouseEvent, tag: Tag) => {
+    e.preventDefault();
+    onChange([...tags, tag]);
+    setQuery("");
+    setTimeout(recalc, 0);
+  };
+  const removeTag = (id: string) => onChange(tags.filter(t => t.id !== id));
+  const createAndAdd = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const n: Tag = { id: newPendingId(), name: query.trim(), _pending: true };
+    onLocalAllTagsChange([...localAllTags, n]);
+    onChange([...tags, n]);
+    setQuery("");
+    setTimeout(recalc, 0);
+  };
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <div onClick={() => { inputRef.current?.focus(); openDrop(); }}
+        style={{ display: "flex", flexWrap: "wrap", gap: 6, minHeight: 36, padding: 6, borderRadius: 8, cursor: "text", alignItems: "center", border: `1px solid ${open ? "#458fff" : "#c9cccf"}`, background: "#fff", boxShadow: open ? "0 0 0 2px rgba(69,143,255,.2)" : "none" }}>
+        {tags.map(tag => (
+          <span key={tag.id} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 5, background: "#f1f1f1", border: "1px solid #d9d9d9", fontSize: 13, color: "#303030" }}>
+            {tag.name}
+            <button onMouseDown={e => { e.preventDefault(); removeTag(tag.id); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#8c9196", fontSize: 15, lineHeight: 1, padding: 0 }}>×</button>
+          </span>
+        ))}
+        <input ref={inputRef} value={query}
+          onChange={e => { setQuery(e.target.value); openDrop(); }}
+          onFocus={openDrop}
+          onKeyDown={e => {
+            if (e.key === "Backspace" && !query && tags.length) removeTag(tags[tags.length - 1].id);
+            if (e.key === "Enter" && query.trim()) { e.preventDefault(); if (showCreate) createAndAdd(e as unknown as React.MouseEvent); else if (filtered.length > 0) { onChange([...tags, filtered[0]]); setQuery(""); setTimeout(recalc, 0); } }
+            if (e.key === "Escape") setOpen(false);
+          }}
+          placeholder={tags.length ? "" : "Add tags…"}
+          style={{ flex: 1, minWidth: 80, border: "none", outline: "none", fontSize: 13, background: "transparent", color: "#303030", fontFamily: "inherit" }} />
+      </div>
+      {open && rect && (
+        <div style={{ ...S.drop, top: rect.bottom + 4, left: rect.left, width: rect.width }}>
+          {filtered.map(t => (
+            <button key={t.id} onMouseDown={e => addTag(e, t)} style={S.dropItem}
+              onMouseEnter={e => (e.currentTarget.style.background = "#f6f6f7")}
+              onMouseLeave={e => (e.currentTarget.style.background = "none")}>{t.name}</button>
+          ))}
+          {showCreate && (
+            <button onMouseDown={createAndAdd} style={{ ...S.dropItem, color: "#458fff", borderTop: filtered.length > 0 ? "1px solid #f1f1f1" : "none" }}
+              onMouseEnter={e => (e.currentTarget.style.background = "#f6f6f7")}
+              onMouseLeave={e => (e.currentTarget.style.background = "none")}>+ Create "{query.trim()}"</button>
+          )}
+          {filtered.length === 0 && !showCreate && (
+            <div style={{ padding: "12px", fontSize: 13, color: "#8c9196", textAlign: "center" }}>No tags found</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── ProductTypeInput ───────────────────────────────────────────────────── */
+function ProductTypeInput({ selectedType, onChange, localTypes, onLocalTypesChange }:
+  { selectedType: ProductType | null; onChange: (v: ProductType | null) => void; localTypes: ProductType[]; onLocalTypesChange: (types: ProductType[]) => void }) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const { rect, recalc } = useDropdownPosition(open, ref);
+
+  useEffect(() => {
+    const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) { setOpen(false); setQuery(""); } };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
+
+  const filtered = localTypes.filter(t => !query || t.name.toLowerCase().includes(query.toLowerCase()));
+  const showCreate = query.trim() !== "" && !localTypes.find(t => t.name.toLowerCase() === query.trim().toLowerCase());
+  const openDrop = () => { recalc(); setOpen(true); };
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <div onClick={() => { inputRef.current?.focus(); openDrop(); }}
+        style={{ display: "flex", flexWrap: "wrap", gap: 6, minHeight: 36, padding: 6, borderRadius: 8, cursor: "text", alignItems: "center", border: `1px solid ${open ? "#458fff" : "#c9cccf"}`, background: "#fff", boxShadow: open ? "0 0 0 2px rgba(69,143,255,.2)" : "none" }}>
+        {selectedType && (
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 5, background: "#f1f1f1", border: "1px solid #d9d9d9", fontSize: 13, color: "#303030" }}>
+            {selectedType.name}
+            <button onMouseDown={e => { e.preventDefault(); onChange(null); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#8c9196", fontSize: 15, lineHeight: 1, padding: 0 }}>×</button>
+          </span>
+        )}
+        <input ref={inputRef} value={query}
+          onChange={e => { setQuery(e.target.value); openDrop(); }}
+          onFocus={openDrop}
+          placeholder={selectedType ? "" : "Search or create…"}
+          style={{ flex: 1, minWidth: 80, border: "none", outline: "none", fontSize: 13, background: "transparent", color: "#303030", fontFamily: "inherit" }}
+          onKeyDown={e => { if (e.key === "Escape") setOpen(false); }} />
+      </div>
+      {open && rect && (
+        <div style={{ ...S.drop, top: rect.bottom + 4, left: rect.left, width: rect.width }}>
+          {filtered.map(t => (
+            <button key={t.id} onMouseDown={e => { e.preventDefault(); onChange(t); setQuery(""); setOpen(false); }}
+              style={{ ...S.dropItem, background: selectedType?.id === t.id ? "#f0f6ff" : "none" }}
+              onMouseEnter={e => (e.currentTarget.style.background = "#f6f6f7")}
+              onMouseLeave={e => (e.currentTarget.style.background = selectedType?.id === t.id ? "#f0f6ff" : "none")}>{t.name}</button>
+          ))}
+          {showCreate && (
+            <button onMouseDown={e => { e.preventDefault(); const n: ProductType = { id: newPendingId(), name: query.trim(), _pending: true }; onLocalTypesChange([...localTypes, n]); onChange(n); setQuery(""); setOpen(false); }}
+              style={{ ...S.dropItem, color: "#458fff", borderTop: filtered.length > 0 ? "1px solid #f1f1f1" : "none" }}
+              onMouseEnter={e => (e.currentTarget.style.background = "#f6f6f7")}
+              onMouseLeave={e => (e.currentTarget.style.background = "none")}>+ Create "{query.trim()}"</button>
+          )}
+          {filtered.length === 0 && !showCreate && (
+            <div style={{ padding: "12px", fontSize: 13, color: "#8c9196", textAlign: "center" }}>No types found</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── CategoryPicker ─────────────────────────────────────────────────────── */
+function CategoryPicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [parent, setParent] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  const { rect, recalc } = useDropdownPosition(open, ref);
+
+  useEffect(() => {
+    const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
+
+  const openDrop = () => { recalc(); setParent(null); setSearch(""); setOpen(true); };
+  const filtered = parent ? (CATEGORY_TREE[parent] || []) : TOP_CATEGORIES.filter(c => c.toLowerCase().includes(search.toLowerCase()));
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <div onClick={openDrop} style={{ ...S.inp, display: "flex", alignItems: "center", cursor: "pointer", color: value ? "#303030" : "#6d7175" }}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8c9196" strokeWidth="2" style={{ marginRight: 6, flexShrink: 0 }}><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        <span style={{ flex: 1, fontSize: 14 }}>{value || "Search categories"}</span>
+        {value && <button onClick={e => { e.stopPropagation(); onChange(""); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#8c9196" }}>×</button>}
+      </div>
+      {open && rect && (
+        <div style={{ ...S.drop, top: rect.bottom + 4, left: rect.left, width: rect.width, maxHeight: 280 }}>
+          {!parent ? (
+            <div style={{ padding: "8px 8px 4px" }}>
+              <div style={{ display: "flex", alignItems: "center", padding: "6px 10px", borderRadius: 6, border: "1px solid #e3e3e3", background: "#f1f1f1" }}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8c9196" strokeWidth="2" style={{ marginRight: 6 }}><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                <input autoFocus value={search} onChange={e => setSearch(e.target.value)} placeholder="Search categories" style={{ border: "none", outline: "none", background: "transparent", fontSize: 13, flex: 1 }} />
+              </div>
+            </div>
+          ) : (
+            <button onClick={() => setParent(null)} style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", padding: "10px 14px", background: "none", border: "none", borderBottom: "1px solid #e3e3e3", cursor: "pointer", fontSize: 13, color: "#303030", fontWeight: 500 }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6"/></svg>
+              Back
+            </button>
+          )}
+          <div style={{ overflowY: "auto", maxHeight: 220 }}>
+            {filtered.map(cat => {
+              const hasChildren = !parent && CATEGORY_TREE[cat]?.length > 0;
+              return (
+                <button key={cat} onClick={() => { if (hasChildren) setParent(cat); else { onChange(cat); setOpen(false); } }}
+                  style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", padding: "10px 14px", background: "none", border: "none", borderTop: "1px solid #f1f1f1", cursor: "pointer", fontSize: 13, color: "#303030", textAlign: "left" }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "#f6f6f7")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "none")}>
+                  <span>{cat}</span>
+                  {hasChildren && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8c9196" strokeWidth="2"><polyline points="9 18 15 12 9 6"/></svg>}
+                </button>
+              );
+            })}
+            {filtered.length === 0 && <div style={{ padding: "16px", fontSize: 13, color: "#8c9196", textAlign: "center" }}>No results</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── RichTextEditor ─────────────────────────────────────────────────────── */
+interface LinkModalState { show: boolean; url: string; text: string; }
+interface VideoModalState { show: boolean; url: string; }
+
+function RichTextEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const editorRef = useRef<HTMLDivElement>(null);
+  const [codeView, setCodeView] = useState(false);
+  const [htmlValue, setHtmlValue] = useState(value);
+  const [blockType, setBlockType] = useState("p");
+  const [linkModal, setLinkModal] = useState<LinkModalState>({ show: false, url: "", text: "" });
+  const [videoModal, setVideoModal] = useState<VideoModalState>({ show: false, url: "" });
+  const [colorPicker, setColorPicker] = useState(false);
+  const [moreMenu, setMoreMenu] = useState(false);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const savedRangeRef = useRef<Range | null>(null);
+
+  const saveRange = () => {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0) savedRangeRef.current = sel.getRangeAt(0).cloneRange();
+  };
+
+  const restoreRange = () => {
+    const sel = window.getSelection();
+    if (sel && savedRangeRef.current) { sel.removeAllRanges(); sel.addRange(savedRangeRef.current); }
+  };
+
+  const exec = (cmd: string, value?: string) => {
+    editorRef.current?.focus();
+    document.execCommand(cmd, false, value);
+    syncValue();
+  };
+
+  const syncValue = () => {
+    if (editorRef.current) onChange(editorRef.current.innerHTML);
+  };
+
+  useEffect(() => {
+    if (!codeView && editorRef.current && editorRef.current.innerHTML !== value) {
+      editorRef.current.innerHTML = value;
+    }
+  }, [codeView]);
+
+  const applyBlockType = (type: string) => {
+    setBlockType(type);
+    editorRef.current?.focus();
+    if (type === "p") document.execCommand("formatBlock", false, "p");
+    else if (type === "h1") document.execCommand("formatBlock", false, "h1");
+    else if (type === "h2") document.execCommand("formatBlock", false, "h2");
+    else if (type === "h3") document.execCommand("formatBlock", false, "h3");
+    else if (type === "blockquote") document.execCommand("formatBlock", false, "blockquote");
+    syncValue();
+  };
+
+  const insertLink = () => {
+    saveRange();
+    const sel = window.getSelection();
+    const selectedText = sel?.toString() || "";
+    setLinkModal({ show: true, url: "", text: selectedText });
+  };
+
+  const confirmLink = () => {
+    restoreRange();
+    editorRef.current?.focus();
+    if (linkModal.text && !window.getSelection()?.toString()) {
+      document.execCommand("insertHTML", false, `<a href="${linkModal.url}" target="_blank" style="color:#458fff;text-decoration:underline">${linkModal.text}</a>`);
+    } else {
+      document.execCommand("createLink", false, linkModal.url);
+      const links = editorRef.current?.querySelectorAll("a");
+      links?.forEach(a => { a.target = "_blank"; a.style.color = "#458fff"; });
+    }
+    syncValue();
+    setLinkModal({ show: false, url: "", text: "" });
+  };
+
+  const insertImage = (file: File) => {
+    const url = URL.createObjectURL(file);
+    editorRef.current?.focus();
+    document.execCommand("insertHTML", false, `<img src="${url}" alt="${file.name}" style="max-width:100%;border-radius:6px;margin:4px 0" />`);
+    syncValue();
+  };
+
+  const insertVideo = () => {
+    saveRange();
+    setVideoModal({ show: true, url: "" });
+  };
+
+  const confirmVideo = () => {
+    restoreRange();
+    editorRef.current?.focus();
+    const url = videoModal.url.trim();
+    let embedHtml = "";
+    if (url.includes("youtube.com") || url.includes("youtu.be")) {
+      const id = url.match(/(?:v=|youtu\.be\/)([^&?/]+)/)?.[1];
+      if (id) embedHtml = `<div style="margin:8px 0"><iframe width="560" height="315" src="https://www.youtube.com/embed/${id}" frameborder="0" allowfullscreen style="max-width:100%;border-radius:8px"></iframe></div>`;
+    } else if (url.match(/\.(mp4|webm|ogg)$/i)) {
+      embedHtml = `<div style="margin:8px 0"><video controls style="max-width:100%;border-radius:8px"><source src="${url}" /></video></div>`;
+    } else {
+      embedHtml = `<div style="margin:8px 0"><iframe src="${url}" frameborder="0" allowfullscreen style="max-width:100%;width:560px;height:315px;border-radius:8px"></iframe></div>`;
+    }
+    document.execCommand("insertHTML", false, embedHtml);
+    syncValue();
+    setVideoModal({ show: false, url: "" });
+  };
+
+  const COLORS = ["#000000","#303030","#d72c0d","#e67e22","#f1c40f","#1a9c3e","#3498db","#9b59b6","#e91e63","#ffffff","#888888","#c0392b","#d35400","#f39c12","#27ae60","#2980b9","#8e44ad","#ff5722"];
+
+  const toolbarBtn = (onClick: () => void, title: string, active?: boolean, children?: React.ReactNode) => (
+    <button type="button" title={title} onClick={onClick}
+      style={{ padding: "3px 6px", fontSize: 13, background: active ? "#e8f0fe" : "none", border: active ? "1px solid #b8d4ff" : "1px solid transparent", cursor: "pointer", borderRadius: 4, color: active ? "#458fff" : "#303030", display: "flex", alignItems: "center", justifyContent: "center", minWidth: 26, height: 26, transition: "background .12s" }}
+      onMouseEnter={e => { if (!active) e.currentTarget.style.background = "#f1f1f1"; }}
+      onMouseLeave={e => { if (!active) e.currentTarget.style.background = "none"; }}>
+      {children}
+    </button>
+  );
+
+  const Divider = () => <div style={{ width: 1, height: 18, background: "#e3e3e3", margin: "0 2px", flexShrink: 0 }} />;
+
+  return (
+    <div style={{ border: "1px solid #c9cccf", borderRadius: 7, overflow: "visible", position: "relative" }}>
+      {/* Toolbar */}
+      <div style={{ borderBottom: "1px solid #e3e3e3", background: "#f9fafb", borderRadius: "7px 7px 0 0" }}>
+        {/* Row 1 */}
+        <div style={{ display: "flex", alignItems: "center", gap: 1, padding: "4px 6px", flexWrap: "wrap" }}>
+          {/* Block type */}
+          <select value={blockType} onChange={e => applyBlockType(e.target.value)}
+            style={{ fontSize: 12, border: "1px solid #d9d9d9", borderRadius: 4, padding: "2px 6px", background: "#fff", cursor: "pointer", color: "#303030", marginRight: 4, height: 26 }}>
+            <option value="p">Paragraph</option>
+            <option value="h1">Heading 1</option>
+            <option value="h2">Heading 2</option>
+            <option value="h3">Heading 3</option>
+            <option value="blockquote">Quote</option>
+          </select>
+
+          <Divider />
+
+          {/* Bold */}
+          {toolbarBtn(() => exec("bold"), "Bold", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/><path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/></svg>)}
+          {/* Italic */}
+          {toolbarBtn(() => exec("italic"), "Italic", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="19" y1="4" x2="10" y2="4"/><line x1="14" y1="20" x2="5" y2="20"/><line x1="15" y1="4" x2="9" y2="20"/></svg>)}
+          {/* Underline */}
+          {toolbarBtn(() => exec("underline"), "Underline", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M6 3v7a6 6 0 0 0 6 6 6 6 0 0 0 6-6V3"/><line x1="4" y1="21" x2="20" y2="21"/></svg>)}
+
+          {/* Font color */}
+          <div style={{ position: "relative" }}>
+            {toolbarBtn(() => { saveRange(); setColorPicker(p => !p); }, "Font Color", colorPicker,
+              <span style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                <span style={{ fontSize: 13, fontWeight: 700, lineHeight: 1 }}>A</span>
+                <span style={{ width: 13, height: 3, background: "#d72c0d", borderRadius: 1, marginTop: 1 }} />
+              </span>)}
+            {colorPicker && (
+              <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 9999, background: "#fff", border: "1px solid #e3e3e3", borderRadius: 8, padding: 8, boxShadow: "0 4px 16px rgba(0,0,0,.15)", display: "grid", gridTemplateColumns: "repeat(9, 20px)", gap: 3, marginTop: 4 }}>
+                {COLORS.map(c => (
+                  <button key={c} type="button" title={c} onClick={() => { restoreRange(); exec("foreColor", c); setColorPicker(false); }}
+                    style={{ width: 20, height: 20, borderRadius: 3, background: c, border: c === "#ffffff" ? "1px solid #ccc" : "none", cursor: "pointer" }} />
+                ))}
+              </div>
+            )}
+          </div>
+
+          <Divider />
+
+          {/* Alignment */}
+          {toolbarBtn(() => exec("justifyLeft"), "Align Left",
+            false, <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="18" y2="18"/></svg>)}
+          {toolbarBtn(() => exec("justifyCenter"), "Center",
+            false, <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="6" y1="12" x2="18" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/></svg>)}
+          {toolbarBtn(() => exec("justifyRight"), "Align Right",
+            false, <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="9" y1="12" x2="21" y2="12"/><line x1="6" y1="18" x2="21" y2="18"/></svg>)}
+          {toolbarBtn(() => exec("justifyFull"), "Justify",
+            false, <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>)}
+
+          <Divider />
+
+          {/* Link */}
+          {toolbarBtn(insertLink, "Insert Link", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>)}
+          {/* Image */}
+          {toolbarBtn(() => imageInputRef.current?.click(), "Insert Image", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>)}
+          <input ref={imageInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { const f = e.target.files?.[0]; if (f) insertImage(f); e.target.value = ""; }} />
+          {/* Video */}
+          {toolbarBtn(insertVideo, "Insert Video", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>)}
+
+          <Divider />
+
+          {/* More */}
+          <div style={{ position: "relative" }}>
+            {toolbarBtn(() => setMoreMenu(p => !p), "More options", moreMenu,
+              <span style={{ fontSize: 16, fontWeight: 700, letterSpacing: 1 }}>···</span>)}
+            {moreMenu && (
+              <div style={{ position: "absolute", top: "100%", right: 0, zIndex: 9999, background: "#fff", border: "1px solid #e3e3e3", borderRadius: 8, padding: "6px 0", boxShadow: "0 4px 16px rgba(0,0,0,.15)", minWidth: 160, marginTop: 4 }}>
+                {[
+                  { label: "Strikethrough", cmd: () => exec("strikeThrough") },
+                  { label: "Superscript", cmd: () => exec("superscript") },
+                  { label: "Subscript", cmd: () => exec("subscript") },
+                  { label: "Remove Format", cmd: () => exec("removeFormat") },
+                ].map(item => (
+                  <button key={item.label} type="button" onClick={() => { item.cmd(); setMoreMenu(false); }}
+                    style={{ display: "block", width: "100%", padding: "7px 14px", background: "none", border: "none", cursor: "pointer", fontSize: 13, color: "#303030", textAlign: "left" }}
+                    onMouseEnter={e => (e.currentTarget.style.background = "#f6f6f7")} onMouseLeave={e => (e.currentTarget.style.background = "none")}>
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Code view */}
+          <div style={{ marginLeft: "auto" }}>
+            {toolbarBtn(() => {
+              if (!codeView) { setHtmlValue(editorRef.current?.innerHTML || ""); }
+              else { if (editorRef.current) editorRef.current.innerHTML = htmlValue; onChange(htmlValue); }
+              setCodeView(p => !p);
+            }, "HTML Code View", codeView,
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>)}
+          </div>
+        </div>
+
+        {/* Row 2 — list controls */}
+        <div style={{ display: "flex", alignItems: "center", gap: 1, padding: "3px 6px 4px", borderTop: "1px solid #f0f0f0" }}>
+          {toolbarBtn(() => exec("insertUnorderedList"), "Bullet List", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/><circle cx="4" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1" fill="currentColor" stroke="none"/></svg>)}
+          {toolbarBtn(() => exec("insertOrderedList"), "Numbered List", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="10" y1="6" x2="21" y2="6"/><line x1="10" y1="12" x2="21" y2="12"/><line x1="10" y1="18" x2="21" y2="18"/><text x="2" y="8" fontSize="7" fill="currentColor" stroke="none">1</text><text x="2" y="14" fontSize="7" fill="currentColor" stroke="none">2</text><text x="2" y="20" fontSize="7" fill="currentColor" stroke="none">3</text></svg>)}
+          {toolbarBtn(() => exec("indent"), "Indent", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/><polyline points="7 10 11 12 7 14"/><line x1="11" y1="12" x2="21" y2="12"/></svg>)}
+          {toolbarBtn(() => exec("outdent"), "Outdent", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/><polyline points="11 10 7 12 11 14"/><line x1="7" y1="12" x2="21" y2="12"/></svg>)}
+          {toolbarBtn(() => exec("removeFormat"), "Clear Formatting", false,
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg>)}
+        </div>
+      </div>
+
+      {/* Editor area */}
+      {codeView ? (
+        <textarea value={htmlValue} onChange={e => setHtmlValue(e.target.value)} rows={8}
+          style={{ width: "100%", border: "none", outline: "none", resize: "vertical", padding: 10, fontSize: 12, fontFamily: "monospace", color: "#303030", display: "block", boxSizing: "border-box", minHeight: 160, background: "#f8f8f8" }} />
+      ) : (
+        <div ref={editorRef} contentEditable suppressContentEditableWarning
+          onInput={syncValue} onKeyUp={syncValue} onMouseUp={syncValue}
+          data-placeholder="اكتب وصف المنتج هنا…"
+          style={{
+            minHeight: 160, padding: "12px 14px", outline: "none", fontSize: 15, lineHeight: 1.8, color: "#303030",
+            fontFamily: '"Amiri", "Scheherazade New", "Traditional Arabic", serif',
+            direction: "rtl", textAlign: "right",
+          }}
+          dangerouslySetInnerHTML={undefined}
+        />
+      )}
+
+      {/* Link Modal */}
+      {linkModal.show && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 10001, background: "rgba(0,0,0,.4)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={e => { if (e.target === e.currentTarget) setLinkModal({ show: false, url: "", text: "" }); }}>
+          <div style={{ background: "#fff", borderRadius: 10, padding: 20, width: "100%", maxWidth: 400, boxShadow: "0 8px 40px rgba(0,0,0,.18)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14 }}>
+              <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700 }}>Insert Link</h3>
+              <button onClick={() => setLinkModal({ show: false, url: "", text: "" })} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 20, color: "#8c9196" }}>×</button>
+            </div>
+            <div style={{ marginBottom: 12 }}>
+              <label style={S.label}>URL</label>
+              <input value={linkModal.url} onChange={e => setLinkModal(p => ({ ...p, url: e.target.value }))}
+                placeholder="https://example.com" autoFocus
+                style={{ ...S.inp }} onKeyDown={e => { if (e.key === "Enter") confirmLink(); }} />
+            </div>
+            {!window.getSelection()?.toString() && (
+              <div style={{ marginBottom: 14 }}>
+                <label style={S.label}>Link Text</label>
+                <input value={linkModal.text} onChange={e => setLinkModal(p => ({ ...p, text: e.target.value }))} placeholder="Click here"
+                  style={{ ...S.inp }} />
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setLinkModal({ show: false, url: "", text: "" })} style={{ padding: "7px 16px", fontSize: 13, borderRadius: 7, cursor: "pointer", background: "#fff", color: "#303030", border: "1px solid #c9cccf" }}>Cancel</button>
+              <button onClick={confirmLink} disabled={!linkModal.url.trim()} style={{ padding: "7px 16px", fontSize: 13, borderRadius: 7, cursor: "pointer", background: "#458fff", color: "#fff", border: "none", fontWeight: 600, opacity: linkModal.url.trim() ? 1 : 0.5 }}>Insert</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Video Modal */}
+      {videoModal.show && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 10001, background: "rgba(0,0,0,.4)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={e => { if (e.target === e.currentTarget) setVideoModal({ show: false, url: "" }); }}>
+          <div style={{ background: "#fff", borderRadius: 10, padding: 20, width: "100%", maxWidth: 420, boxShadow: "0 8px 40px rgba(0,0,0,.18)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14 }}>
+              <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700 }}>Insert Video</h3>
+              <button onClick={() => setVideoModal({ show: false, url: "" })} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 20, color: "#8c9196" }}>×</button>
+            </div>
+            <div style={{ marginBottom: 6 }}>
+              <label style={S.label}>Video URL</label>
+              <input value={videoModal.url} onChange={e => setVideoModal(p => ({ ...p, url: e.target.value }))}
+                placeholder="https://youtube.com/watch?v=… or .mp4 URL" autoFocus
+                style={{ ...S.inp }} onKeyDown={e => { if (e.key === "Enter") confirmVideo(); }} />
+            </div>
+            <p style={{ fontSize: 12, color: "#8c9196", margin: "0 0 14px" }}>Supports YouTube, direct .mp4/.webm links</p>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setVideoModal({ show: false, url: "" })} style={{ padding: "7px 16px", fontSize: 13, borderRadius: 7, cursor: "pointer", background: "#fff", color: "#303030", border: "1px solid #c9cccf" }}>Cancel</button>
+              <button onClick={confirmVideo} disabled={!videoModal.url.trim()} style={{ padding: "7px 16px", fontSize: 13, borderRadius: 7, cursor: "pointer", background: "#458fff", color: "#fff", border: "none", fontWeight: 600, opacity: videoModal.url.trim() ? 1 : 0.5 }}>Insert</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── MediaSection ───────────────────────────────────────────────────────── */
+function MediaSection({ images, onChange }: { images: ProductImage[]; onChange: (imgs: ProductImage[]) => void }) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [errors, setErrors] = useState<string[]>([]);
+  const fileDragCounter = useRef(0);
+  const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
+  const [overIdx, setOverIdx] = useState<number | null>(null);
+  const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
+
+  const process = useCallback((files: File[]) => {
+    const errs: string[] = []; const valid: ProductImage[] = [];
+    files.forEach(file => {
+      const isImg = ALLOWED_IMAGE_TYPES.includes(file.type); const isVid = file.type === "video/mp4";
+      if (!isImg && !isVid) { errs.push(`"${file.name}" — نوع الملف غير مسموح به. المسموح: .png, .jpg, .mp4`); return; }
+      if (isImg && file.size > MAX_IMAGE_SIZE) { errs.push(`"${file.name}" — الصورة تتجاوز الحد الأقصى (10 ميجا)`); return; }
+      if (isVid && file.size > MAX_VIDEO_SIZE) { errs.push(`"${file.name}" — الفيديو يتجاوز الحد الأقصى (50 ميجا)`); return; }
+      valid.push({ url: URL.createObjectURL(file), alt: file.name, file, type: isVid ? "video" : "image" });
+    });
+    setErrors(errs); if (valid.length > 0) onChange([...images, ...valid]);
+  }, [images, onChange]);
+
+  const onZoneDragEnter = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); fileDragCounter.current++; if (e.dataTransfer.types.includes("Files")) setIsDraggingFile(true); };
+  const onZoneDragLeave = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); fileDragCounter.current--; if (fileDragCounter.current === 0) setIsDraggingFile(false); };
+  const onZoneDragOver = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); };
+  const onZoneDrop = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); setIsDraggingFile(false); fileDragCounter.current = 0; process(Array.from(e.dataTransfer.files)); };
+
+  const onThumbDragStart = (e: React.DragEvent, idx: number) => {
+    setDraggingIdx(idx); e.dataTransfer.effectAllowed = "move";
+    const ghost = document.createElement("div"); ghost.style.cssText = "position:fixed;top:-200px;width:1px;height:1px;";
+    document.body.appendChild(ghost); e.dataTransfer.setDragImage(ghost, 0, 0);
+    setTimeout(() => document.body.removeChild(ghost), 0);
+  };
+  const onThumbDragEnter = (e: React.DragEvent, idx: number) => { e.preventDefault(); if (draggingIdx !== null && idx !== draggingIdx) setOverIdx(idx); };
+  const onThumbDragOver = (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; };
+  const onThumbDrop = (e: React.DragEvent, dropIdx: number) => {
+    e.preventDefault();
+    if (draggingIdx === null || draggingIdx === dropIdx) return;
+    const r = [...images]; const [m] = r.splice(draggingIdx, 1); r.splice(dropIdx, 0, m);
+    onChange(r); setDraggingIdx(null); setOverIdx(null);
+  };
+  const onThumbDragEnd = () => { setDraggingIdx(null); setOverIdx(null); };
+
+  return (
+    <div>
+      <label style={S.label}>الوسائط</label>
+      {errors.map((err, i) => (
+        <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", background: "#fff4f4", border: "1px solid #ffc9c9", borderRadius: 7, marginBottom: 4, fontSize: 12, color: "#d72c0d" }}>
+          <span>⚠ {err}</span>
+          <button onClick={() => setErrors(prev => prev.filter((_, j) => j !== i))} style={{ background: "none", border: "none", cursor: "pointer", color: "#d72c0d", fontSize: 16, padding: "0 2px" }}>×</button>
+        </div>
+      ))}
+      <div onDragEnter={onZoneDragEnter} onDragLeave={onZoneDragLeave} onDragOver={onZoneDragOver} onDrop={onZoneDrop}
+        onClick={() => fileRef.current?.click()}
+        style={{ border: `2px dashed ${isDraggingFile ? "#458fff" : "#c9cccf"}`, borderRadius: 10, padding: "32px 20px", textAlign: "center", background: isDraggingFile ? "#f0f6ff" : "#fafafa", cursor: "pointer", transition: "all .2s", position: "relative" }}>
+        <div style={{ width: 44, height: 44, borderRadius: "50%", background: isDraggingFile ? "#d6e8ff" : "#f1f1f1", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px", transition: "background .2s" }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={isDraggingFile ? "#458fff" : "#6d7175"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
+            <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
+          </svg>
+        </div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: isDraggingFile ? "#458fff" : "#303030", marginBottom: 4 }}>
+          {isDraggingFile ? "أفلِت الملفات هنا" : "اسحب الصور أو الفيديو وأفلِتها هنا، أو انقر لاختيارها"}
+        </div>
+        <div style={{ fontSize: 12, color: "#6d7175", lineHeight: 1.7 }}>
+          <span>الحجم الأقصى: <strong>10 ميجا</strong> (صور), <strong>50 ميجا</strong> (فيديو)</span><br />
+          <span>الأنواع المسموحة: <strong>.png, .jpg, .mp4</strong></span>
+        </div>
+        {isDraggingFile && <div style={{ position: "absolute", inset: 0, borderRadius: 10, background: "rgba(69,143,255,.06)", pointerEvents: "none" }} />}
+      </div>
+      <input ref={fileRef} type="file" multiple accept=".png,.jpg,.jpeg,.mp4,image/png,image/jpeg,video/mp4" style={{ display: "none" }}
+        onChange={e => { if (e.target.files) process(Array.from(e.target.files)); e.target.value = ""; }} />
+      {images.length > 0 && (
+        <>
+          <div style={{ fontSize: 11, color: "#8c9196", marginTop: 12, marginBottom: 6, display: "flex", alignItems: "center", gap: 4 }}>
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="9" cy="5" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none"/>
+              <circle cx="9" cy="19" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="5" r="1" fill="currentColor" stroke="none"/>
+              <circle cx="15" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="19" r="1" fill="currentColor" stroke="none"/>
+            </svg>
+            اسحب الصور لإعادة الترتيب — الأولى هي الصورة المميزة
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+            {images.map((img, index) => {
+              const isDraggingThis = draggingIdx === index;
+              const isOver = overIdx === index;
+              return (
+                <div key={img.url + index} draggable
+                  onDragStart={e => onThumbDragStart(e, index)}
+                  onDragEnter={e => onThumbDragEnter(e, index)}
+                  onDragOver={onThumbDragOver}
+                  onDrop={e => onThumbDrop(e, index)}
+                  onDragEnd={onThumbDragEnd}
+                  style={{ width: 110, height: 110, borderRadius: 8, overflow: "hidden", position: "relative", border: isOver ? "2px dashed #458fff" : `2px solid ${index === 0 ? "#303030" : "#e3e3e3"}`, background: "#f1f1f1", flexShrink: 0, cursor: "grab", opacity: isDraggingThis ? 0.35 : 1, transform: isOver && !isDraggingThis ? "scale(1.04)" : "scale(1)", transition: "opacity .15s, transform .15s, border-color .15s", boxShadow: isDraggingThis ? "none" : isOver ? "0 0 0 3px rgba(69,143,255,.25)" : "none" }}>
+                  <div style={{ position: "absolute", top: 5, left: 5, zIndex: 2, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 2, opacity: 0.7, pointerEvents: "none" }}>
+                    {[0,1,2,3].map(d => <div key={d} style={{ width: 3, height: 3, borderRadius: "50%", background: "#fff", boxShadow: "0 0 2px rgba(0,0,0,.6)" }} />)}
+                  </div>
+                  {img.type === "video"
+                    ? <video src={img.url} style={{ width: "100%", height: "100%", objectFit: "cover" }} muted />
+                    : <img src={img.url} alt={img.alt} style={{ width: "100%", height: "100%", objectFit: "cover" }} />}
+                  <button type="button" onClick={e => { e.stopPropagation(); onChange(images.filter((_, j) => j !== index)); }}
+                    style={{ position: "absolute", top: 5, right: 5, width: 22, height: 22, borderRadius: 5, border: "none", background: "rgba(0,0,0,.65)", color: "#fff", cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1, zIndex: 3 }}>×</button>
+                  {index === 0 && <div style={{ position: "absolute", left: 5, bottom: 5, padding: "2px 6px", borderRadius: 4, background: "rgba(0,0,0,.65)", color: "#fff", fontSize: 11, fontWeight: 500, zIndex: 2 }}>مميز</div>}
+                  {img.type === "video" && <div style={{ position: "absolute", right: 5, bottom: 5, padding: "2px 6px", borderRadius: 4, background: "rgba(0,0,0,.65)", color: "#fff", fontSize: 11, display: "flex", alignItems: "center", gap: 3, zIndex: 2 }}><svg width="10" height="10" viewBox="0 0 24 24" fill="white"><polygon points="5 3 19 12 5 21 5 3"/></svg>فيديو</div>}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ─── Main ProductForm ───────────────────────────────────────────────────── */
+export default function ProductForm() {
+  const [form, setForm] = useState<ProductFormState>({
+    title: "", description: "", url_handle: "", status: "active", product_type: null, tags: [],
+    price: "", compare_at_price: "", cost_per_item: "", charge_tax: true,
+    track_inventory: true, quantity: 0, sku: "", barcode: "", continue_selling: false,
+    category: "", options: [], images: [], variants: [],
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [localTypes, setLocalTypes] = useState<ProductType[]>([]);
+  const [localAllTags, setLocalAllTags] = useState<Tag[]>([]);
+  // More details inside Location/Quantity box
+  const [showMoreDetails, setShowMoreDetails] = useState(false);
+  const [handleEdited, setHandleEdited] = useState(false);
+
+  const set = (key: keyof ProductFormState, val: unknown) => setForm(f => ({ ...f, [key]: val }));
+  const iFocus = (e: React.FocusEvent<HTMLInputElement | HTMLSelectElement>) => { e.target.style.borderColor = "#458fff"; e.target.style.boxShadow = "0 0 0 2px rgba(69,143,255,.2)"; };
+  const iBlur = (e: React.FocusEvent<HTMLInputElement | HTMLSelectElement>) => { e.target.style.borderColor = "#c9cccf"; e.target.style.boxShadow = "none"; };
+
+  const handleAddImage = useCallback((file: File, cb: (img: ProductImage) => void) => {
+    const img: ProductImage = { url: URL.createObjectURL(file), alt: file.name, file, type: "image" };
+    setForm(f => ({ ...f, images: [...f.images, img] })); cb(img);
+  }, []);
+
+  const handleVariantPickImage = handleAddImage;
+
+  const handleSave = async () => {
+    if (!form.title.trim()) { setError("Title is required"); return; }
+    setSaving(true);
+    try { await new Promise(r => setTimeout(r, 800)); alert("Product saved!"); }
+    catch { setError("Failed to save."); }
+    finally { setSaving(false); }
+  };
+
+  /* ── Pricing discount badge calculation ── */
+  const priceVal = parseFloat(form.price);
+  const compareVal = parseFloat(form.compare_at_price);
+  const hasDiscount = form.price && form.compare_at_price && compareVal > priceVal && priceVal > 0;
+  const discountPct = hasDiscount ? Math.round((1 - priceVal / compareVal) * 100) : 0;
+
+  return (
+    <div style={S.body}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400;1,700&display=swap');
+        @keyframes spin { from { transform:rotate(0deg) } to { transform:rotate(360deg) } }
+        * { box-sizing:border-box }
+        input[type=number]::-webkit-inner-spin-button { opacity:0 }
+        input[type=number]:hover::-webkit-inner-spin-button { opacity:1 }
+        ::-webkit-scrollbar { width:6px; height:6px }
+        ::-webkit-scrollbar-thumb { background:#d0d0d0; border-radius:4px }
+        [contenteditable][data-placeholder]:empty::before { content:attr(data-placeholder); color:#aaa; pointer-events:none; font-style:italic; }
+        [contenteditable] { caret-color: #303030; }
+        [contenteditable] h1 { font-size:1.8em; font-weight:700; margin:.5em 0; }
+        [contenteditable] h2 { font-size:1.4em; font-weight:700; margin:.5em 0; }
+        [contenteditable] h3 { font-size:1.15em; font-weight:700; margin:.5em 0; }
+        [contenteditable] ul { list-style:disc; padding-right:24px; padding-left:0; margin:.4em 0; }
+        [contenteditable] ol { list-style:decimal; padding-right:24px; padding-left:0; margin:.4em 0; }
+        [contenteditable] li { margin:.2em 0; }
+        [contenteditable] blockquote { border-right:3px solid #c9cccf; padding-right:12px; margin:.5em 0; color:#555; font-style:italic; }
+        [contenteditable] a { color:#458fff; text-decoration:underline; }
+        [contenteditable] img { max-width:100%; border-radius:6px; }
+      `}</style>
+
+      <div style={S.topbar}>
+        <button style={{ background: "none", border: "none", color: "#9a9a9a", fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6"/></svg>
+          <span style={{ color: "#fff", fontWeight: 600 }}>Products</span>
+        </button>
+        <span style={{ flex: 1, color: "#9a9a9a", fontSize: 13, textAlign: "center" }}>{"Unsaved product"}</span>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button style={{ padding: "6px 14px", fontSize: 13, borderRadius: 7, cursor: "pointer", background: "#2a2a2a", color: "#c9cccf", border: "1px solid #424242" }}>Discard</button>
+          <button onClick={handleSave} disabled={saving}
+            style={{ padding: "6px 16px", fontSize: 13, fontWeight: 600, borderRadius: 7, cursor: "pointer", background: "#fff", color: "#1a1a1a", border: "none", display: "flex", alignItems: "center", gap: 6 }}>
+            {saving && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: "spin .8s linear infinite" }}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>}
+            Save
+          </button>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1000, margin: "0 auto", padding: "16px 16px", display: "grid", gridTemplateColumns: "1fr 272px", gap: 12, alignItems: "start" }}>
+
+        <div>
+          {error && (
+            <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 14px", background: "#fff4f4", border: "1px solid #ffc9c9", borderRadius: 8, marginBottom: 10, fontSize: 13, color: "#d72c0d" }}>
+              <span>⚠ {error}</span>
+              <button onClick={() => setError("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "#d72c0d" }}>×</button>
+            </div>
+          )}
+
+          {/* Title & Description */}
+          <div style={S.card}>
+            <div style={{ marginBottom: 14 }}>
+              <label style={S.label}>Title</label>
+              <input
+                value={form.title}
+                onChange={e => {
+                  const t = e.target.value;
+                  setForm(f => ({
+                    ...f,
+                    title: t,
+                    // auto-fill handle from title only if user hasn't edited it manually
+                    url_handle: handleEdited ? f.url_handle : toHandle(t),
+                  }));
+                }}
+                onFocus={iFocus} onBlur={iBlur}
+                placeholder="Short sleeve t-shirt" style={S.inp} />
+            </div>
+            <div style={{ marginBottom: 14 }}>
+              <label style={S.label}>Description</label>
+              <RichTextEditor value={form.description} onChange={v => set("description", v)} />
+            </div>
+            {/* URL Handle */}
+            <div>
+              <label style={S.label}>URL handle</label>
+              <div style={{ display: "flex", alignItems: "center", border: "1px solid #c9cccf", borderRadius: 6, overflow: "hidden", background: "#fff" }}>
+                <span style={{ padding: "0 8px", color: "#6d7175", fontSize: 13, background: "#f6f6f7", borderRight: "1px solid #c9cccf", whiteSpace: "nowrap", lineHeight: "32px" }}>
+                  products/
+                </span>
+                <input
+                  value={form.url_handle}
+                  onChange={e => {
+                    const raw = e.target.value;
+                    setHandleEdited(true);
+                    set("url_handle", raw);
+                  }}
+                  onBlur={e => {
+                    set("url_handle", toHandle(e.target.value));
+                    iBlur(e);
+                  }}
+                  onFocus={e => {
+                    setHandleEdited(true);
+                    iFocus(e);
+                  }}
+                  placeholder="short-sleeve-t-shirt"
+                  style={{ ...S.inp, border: "none", boxShadow: "none", borderRadius: 0, flex: 1, paddingLeft: 8 }}
+                />
+              </div>
+              <p style={{ fontSize: 12, color: "#6d7175", margin: "4px 0 0" }}>
+                Letters, numbers and hyphens only — spaces become dashes automatically
+              </p>
+            </div>
+          </div>
+
+          {/* Media */}
+          <div style={S.card}><MediaSection images={form.images} onChange={imgs => set("images", imgs)} /></div>
+
+          {/* Category */}
+          <div style={S.card}>
+            <label style={S.label}>Category</label>
+            <CategoryPicker value={form.category} onChange={v => set("category", v)} />
+            <p style={{ fontSize: 12, color: "#6d7175", margin: "6px 0 0" }}>Determines tax rates and adds metafields</p>
+          </div>
+
+          {/* ══════ PRICING CARD ══════ */}
+          <div style={S.card}>
+            {/* Header */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+              <span style={S.sectionTitle}>Pricing</span>
+              {hasDiscount && (
+                <span style={{ fontSize: 12, fontWeight: 700, color: "#1a9c3e", background: "#e6f4ea", borderRadius: 99, padding: "3px 10px", whiteSpace: "nowrap" }}>
+                  {discountPct}% off
+                </span>
+              )}
+            </div>
+
+            {/* Original price + Sale price */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+              {/* Original price (compare_at_price) — the higher "was" price */}
+              <div>
+                <label style={S.label}>
+                  Original price
+                  <span style={{ fontSize: 11, fontWeight: 400, color: "#8c9196", marginLeft: 4 }}>(before discount)</span>
+                </label>
+                <div style={{ position: "relative" }}>
+                  <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#6d7175", fontSize: 13, pointerEvents: "none" }}>ج.م</span>
+                  <input type="number" value={form.compare_at_price}
+                    onChange={e => set("compare_at_price", e.target.value)}
+                    placeholder="0.00" min="0" step="0.01"
+                    style={{ ...S.inp, paddingLeft: 38, fontSize: 15, fontWeight: 600 }}
+                    onFocus={iFocus} onBlur={iBlur} />
+                </div>
+              </div>
+              {/* Sale price (price) — what customer pays */}
+              <div>
+                <label style={S.label}>
+                  Sale price
+                  <span style={{ fontSize: 11, fontWeight: 400, color: "#8c9196", marginLeft: 4 }}>(selling price)</span>
+                </label>
+                <div style={{ position: "relative" }}>
+                  <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#1a9c3e", fontSize: 13, pointerEvents: "none" }}>ج.م</span>
+                  <input type="number" value={form.price}
+                    onChange={e => set("price", e.target.value)}
+                    placeholder="0.00" min="0" step="0.01"
+                    style={{ ...S.inp, paddingLeft: 38, fontSize: 15, fontWeight: 600, borderColor: hasDiscount ? "#1a9c3e" : "#c9cccf" }}
+                    onFocus={e => { e.target.style.borderColor = "#1a9c3e"; e.target.style.boxShadow = "0 0 0 2px rgba(26,156,62,.18)"; }}
+                    onBlur={e => { e.target.style.borderColor = hasDiscount ? "#1a9c3e" : "#c9cccf"; e.target.style.boxShadow = "none"; }} />
+                </div>
+              </div>
+            </div>
+
+            {/* Cost per item */}
+            <div style={{ marginBottom: 16 }}>
+              <label style={S.label}>
+                Cost per item
+                <span style={{ fontSize: 11, fontWeight: 400, color: "#8c9196", marginLeft: 4 }}>(for margin calculation only)</span>
+              </label>
+              <div style={{ position: "relative" }}>
+                <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#6d7175", fontSize: 13, pointerEvents: "none" }}>ج.م</span>
+                <input type="number" value={form.cost_per_item}
+                  onChange={e => set("cost_per_item", e.target.value)}
+                  placeholder="0.00" min="0" step="0.01"
+                  style={{ ...S.inp, paddingLeft: 38, fontSize: 15, fontWeight: 600 }}
+                  onFocus={iFocus} onBlur={iBlur} />
+              </div>
+            </div>
+
+            {/* Charge tax */}
+            <label style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13, cursor: "pointer", width: "fit-content" }}>
+              <Toggle checked={form.charge_tax} onChange={v => set("charge_tax", v)} />
+              <span style={{ fontWeight: 500, color: "#303030" }}>Charge tax on this product</span>
+            </label>
+          </div>
+
+          {/* ══════ INVENTORY CARD ══════ */}
+          <div style={S.card}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+              <span style={S.sectionTitle}>Inventory</span>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer" }}>
+                Inventory tracked <Toggle checked={form.track_inventory} onChange={v => set("track_inventory", v)} />
+              </label>
+            </div>
+
+            {/* Location / Quantity box — only when tracking is ON */}
+            {form.track_inventory ? (
+              <div style={{ border: "1px solid #e3e3e3", borderRadius: 7, overflow: "hidden", marginBottom: 14 }}>
+                {/* Header */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr auto", padding: "8px 12px", background: "#f9fafb", borderBottom: "1px solid #e3e3e3" }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: "#6d7175" }}>Location</span>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: "#6d7175" }}>Quantity</span>
+                </div>
+                {/* Shop location row */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr auto", padding: "10px 12px", alignItems: "center", gap: 12, borderBottom: "1px solid #f1f1f1" }}>
+                  <span style={{ fontSize: 13 }}>Shop location</span>
+                  <input type="number" value={form.quantity} onChange={e => set("quantity", parseInt(e.target.value) || 0)}
+                    onFocus={e => { e.target.select(); iFocus(e); }} onBlur={iBlur}
+                    style={{ ...S.inp, width: 80, textAlign: "right" }} min="0" placeholder="0" />
+                </div>
+                {/* More details toggle row */}
+                <div>
+                  <button type="button" onClick={() => setShowMoreDetails(v => !v)}
+                    style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", padding: "9px 12px", background: "none", border: "none", cursor: "pointer", fontSize: 13, color: "#458fff", fontWeight: 500, borderBottom: showMoreDetails ? "1px solid #f1f1f1" : "none", textAlign: "left" }}>
+                    <Chevron up={showMoreDetails} />
+                    More details
+                  </button>
+                  {showMoreDetails && (
+                    <div style={{ padding: "14px 12px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                      <div>
+                        <label style={{ ...S.label, fontSize: 12, color: "#6d7175", fontWeight: 400, marginBottom: 3 }}>SKU (Stock Keeping Unit)</label>
+                        <input value={form.sku} onChange={e => set("sku", e.target.value)} onFocus={iFocus} onBlur={iBlur} style={S.inp} placeholder="e.g. SHIRT-RED-M" />
+                      </div>
+                      <div>
+                        <label style={{ ...S.label, fontSize: 12, color: "#6d7175", fontWeight: 400, marginBottom: 3 }}>Barcode (ISBN, UPC, GTIN, etc.)</label>
+                        <input value={form.barcode} onChange={e => set("barcode", e.target.value)} onFocus={iFocus} onBlur={iBlur} style={S.inp} placeholder="e.g. 123456789" />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              /* Tracking OFF — only show More details (SKU / Barcode) */
+              <div style={{ border: "1px solid #e3e3e3", borderRadius: 7, overflow: "hidden", marginBottom: 14 }}>
+                <button type="button" onClick={() => setShowMoreDetails(v => !v)}
+                  style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", padding: "9px 12px", background: "none", border: "none", cursor: "pointer", fontSize: 13, color: "#458fff", fontWeight: 500, borderBottom: showMoreDetails ? "1px solid #f1f1f1" : "none", textAlign: "left" }}>
+                  <Chevron up={showMoreDetails} />
+                  More details
+                </button>
+                {showMoreDetails && (
+                  <div style={{ padding: "14px 12px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <div>
+                      <label style={{ ...S.label, fontSize: 12, color: "#6d7175", fontWeight: 400, marginBottom: 3 }}>SKU (Stock Keeping Unit)</label>
+                      <input value={form.sku} onChange={e => set("sku", e.target.value)} onFocus={iFocus} onBlur={iBlur} style={S.inp} placeholder="e.g. SHIRT-RED-M" />
+                    </div>
+                    <div>
+                      <label style={{ ...S.label, fontSize: 12, color: "#6d7175", fontWeight: 400, marginBottom: 3 }}>Barcode (ISBN, UPC, GTIN, etc.)</label>
+                      <input value={form.barcode} onChange={e => set("barcode", e.target.value)} onFocus={iFocus} onBlur={iBlur} style={S.inp} placeholder="e.g. 123456789" />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Sell when out of stock — only visible when tracking is ON */}
+            {form.track_inventory && (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", border: "1px solid #e3e3e3", borderRadius: 8, background: "#fafafa" }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "#303030", marginBottom: 2 }}>Sell when out of stock</div>
+                  <div style={{ fontSize: 12, color: "#6d7175" }}>
+                    {form.continue_selling ? "Continue selling when out of stock" : "Stop selling when out of stock"}
+                  </div>
+                </div>
+                <Toggle checked={form.continue_selling} onChange={v => set("continue_selling", v)} />
+              </div>
+            )}
+          </div>
+
+          {/* Variants */}
+          <div style={S.card}>
+            <VariantsSection
+              options={form.options}
+              variants={form.variants}
+              allImages={form.images}
+              onOptionsChange={(opts, vars) => setForm(f => ({ ...f, options: opts, variants: vars }))}
+              onVariantsChange={vars => set("variants", vars)}
+              onAddImage={handleVariantPickImage}
+            />
+          </div>
+        </div>
+
+        {/* Right column */}
+        <div>
+          <div style={S.card}>
+            <label style={{ ...S.label, marginBottom: 8 }}>Status</label>
+            <select value={form.status} onChange={e => set("status", e.target.value)} onFocus={iFocus} onBlur={iBlur}
+              style={{ ...S.inp, cursor: "pointer" }}>
+              <option value="active">Active</option>
+              <option value="draft">Draft</option>
+              <option value="archived">Archived</option>
+            </select>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: form.status === "active" ? "#1a9c3e" : "#faad49", flexShrink: 0 }} />
+              <span style={{ fontSize: 12, color: "#6d7175" }}>{form.status === "active" ? "Live in your store" : "Hidden from customers"}</span>
+            </div>
+          </div>
+          <div style={S.card}>
+            <label style={{ ...S.label, marginBottom: 8 }}>Product type</label>
+            <ProductTypeInput selectedType={form.product_type} onChange={v => set("product_type", v)}
+              localTypes={localTypes} onLocalTypesChange={setLocalTypes} />
+          </div>
+          <div style={S.card}>
+            <label style={{ ...S.label, marginBottom: 8 }}>Tags</label>
+            <TagsInput tags={form.tags} onChange={v => set("tags", v)}
+              localAllTags={localAllTags} onLocalAllTagsChange={setLocalAllTags} />
+          </div>
+
+          {/* SEO — live preview */}
+          <div style={S.card}>
+            <span style={{ fontSize: 14, fontWeight: 600 }}>Search engine listing</span>
+            {!form.title ? (
+              <p style={{ fontSize: 13, color: "#6d7175", margin: "8px 0 0", lineHeight: 1.5 }}>
+                Add a title and description to see how this product might appear in a search engine listing
+              </p>
+            ) : (
+              <div style={{ marginTop: 10, padding: "10px 12px", border: "1px solid #e3e3e3", borderRadius: 6, background: "#fafafa" }}>
+                {/* Green store breadcrumb */}
+                <div style={{ fontSize: 12, color: "#006621", marginBottom: 2 }}>
+                  My Store 6
+                </div>
+                <div style={{ fontSize: 12, color: "#006621", marginBottom: 4, wordBreak: "break-all" }}>
+                  https://kgdfq8-dq.myshopify.com{" › "}products › {form.url_handle ? `${" "}${form.url_handle}` : ""}
+                </div>
+                {/* Blue title */}
+                <div style={{ fontSize: 15, color: "#1a0dab", fontWeight: 400, marginBottom: 4, lineHeight: 1.3 }}>
+                  {form.title}
+                </div>
+                {/* Grey description snippet */}
+                {stripHtml(form.description) && (
+                  <div style={{ fontSize: 13, color: "#545454", lineHeight: 1.5 }}>
+                    {stripHtml(form.description).slice(0, 160)}{stripHtml(form.description).length > 160 ? "…" : ""}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

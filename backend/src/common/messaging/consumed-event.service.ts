@@ -27,16 +27,21 @@ export class ConsumedEventService {
     result = 'ok',
   ): Promise<boolean> {
     try {
-      await this.prisma.guarded().consumedEvent.create({
-        data: {
-          consumer_name: consumerName,
-          message_id: message.id,
-          store_id: message.storeId,
-          mode: message.mode,
-          result,
-        },
-        select: { id: true },
-      });
+      await this.prisma.withTenantTransaction(
+        message.storeId,
+        message.mode,
+        (tx) =>
+          tx.consumedEvent.create({
+            data: {
+              consumer_name: consumerName,
+              message_id: message.id,
+              store_id: message.storeId,
+              mode: message.mode,
+              result,
+            },
+            select: { id: true },
+          }),
+      );
 
       return true;
     } catch (error) {
@@ -65,14 +70,16 @@ export class ConsumedEventService {
     storeId: bigint,
     mode: OutboxRecord['mode'],
   ): Promise<void> {
-    await this.prisma.guarded().consumedEvent.deleteMany({
-      where: {
-        consumer_name: consumerName,
-        message_id: messageId,
-        store_id: storeId,
-        mode,
-      },
-    });
+    await this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+      tx.consumedEvent.deleteMany({
+        where: {
+          consumer_name: consumerName,
+          message_id: messageId,
+          store_id: storeId,
+          mode,
+        },
+      }),
+    );
   }
 
   async wasConsumed(
@@ -81,15 +88,17 @@ export class ConsumedEventService {
     storeId: bigint,
     mode: OutboxRecord['mode'],
   ): Promise<boolean> {
-    const found = await this.prisma.guarded().consumedEvent.findFirst({
-      where: {
-        consumer_name: consumerName,
-        message_id: messageId,
-        store_id: storeId,
-        mode,
-      },
-      select: { id: true },
-    });
+    const found = await this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+      tx.consumedEvent.findFirst({
+        where: {
+          consumer_name: consumerName,
+          message_id: messageId,
+          store_id: storeId,
+          mode,
+        },
+        select: { id: true },
+      }),
+    );
 
     return found !== null;
   }

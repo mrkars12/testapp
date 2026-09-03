@@ -39,6 +39,11 @@ const HANDLED_EVENTS = [
   'payment.collected',
   'order.cancelled',
   'payment.refunded',
+  // Round 9: a paid order whose stock could not be taken. Emitted by
+  // CheckoutFinalizerService when the guarded decrement refuses, and
+  // routed here rather than to a new channel because "something the
+  // merchant must act on" is exactly what this consumer already is.
+  'inventory.oversold',
 ] as const
 
 interface Notice {
@@ -184,6 +189,33 @@ export class PaymentNotificationConsumer implements OnModuleInit {
           title: 'استرداد',
           message: `تم استرداد مبلغ على الطلب رقم ${orderNumber}.`,
         }
+
+      /*
+       * The one notice here that is not a payment event.
+       *
+       * The money was taken and the order stands, but the units were
+       * not there to take — so this is the merchant's only signal that
+       * they owe stock they do not have. Phrased with the count,
+       * because "an order oversold" without a number is not actionable.
+       */
+      case 'inventory.oversold': {
+        const lines = Array.isArray(message.payload.lines)
+          ? (message.payload.lines as { quantity?: number }[])
+          : []
+
+        const units = lines.reduce(
+          (total, line) => total + (Number(line.quantity) || 0),
+          0,
+        )
+
+        return {
+          type: 'inventory.oversold',
+          title: 'نقص في المخزون',
+          message:
+            `الطلب رقم ${orderNumber} اتدفع بس المخزون مكانش كافي ` +
+            `(${units} وحدة). راجع المخزون قبل التجهيز.`,
+        }
+      }
 
       default:
         return null

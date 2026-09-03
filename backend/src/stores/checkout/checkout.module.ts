@@ -4,6 +4,7 @@ import { LedgerModule } from '../../ledger/ledger.module'
 import { MessagingModule } from '../../common/messaging/messaging.module'
 import { IdempotencyModule } from '../../common/idempotency/idempotency.module'
 import { IdsModule } from '../../common/ids/ids.module'
+import { CartModule } from '../cart/cart.module'
 import { PaymentsModule } from '../payments/payments.module'
 import { GatewaysModule } from '../payments/gateways/gateways.module'
 import { CheckoutService } from './checkout.service'
@@ -31,6 +32,9 @@ import { StorefrontCheckoutController } from './storefront-checkout.controller'
     IdsModule,
     PaymentsModule,
     GatewaysModule,
+    // The two-phase cart claim (CartService). One-way: CartModule knows
+    // nothing about checkout, so there is no cycle.
+    CartModule,
   ],
   controllers: [StorefrontCheckoutController],
   providers: [CheckoutService, CheckoutExpiryJob],

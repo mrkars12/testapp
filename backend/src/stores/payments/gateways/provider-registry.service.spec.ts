@@ -9,9 +9,11 @@ const caps = (over: Partial<GatewayCapabilities> = {}): GatewayCapabilities => (
   methods: ['card'],
   currencies: ['USD'],
   exponentOverrides: {},
+  automaticCapture: true,
   manualCapture: false,
   partialCapture: false,
   multiCapture: false,
+  refundSupported: false,
   partialRefund: false,
   voidSupported: false,
   authorizationExpiry: false,
@@ -22,6 +24,7 @@ const caps = (over: Partial<GatewayCapabilities> = {}): GatewayCapabilities => (
   statusPolling: false,
   settlementReports: false,
   webhookResolution: 'none',
+  nextActionKinds: [],
   offlineCommitmentKind: null,
   ...over,
 })
@@ -95,7 +98,11 @@ describe('ProviderRegistry', () => {
       const registry = await build([
         stub(
           { gateway: 'ok', webhooks: true, webhookResolution: 'payload_scoped' },
-          { parseWebhook: async () => [] },
+          {
+            parseWebhook: async () => [],
+            // Payload-scoped routing has nowhere to look without it.
+            extractWebhookAccountRef: () => null,
+          },
         ),
       ])
       expect(registry.capabilities('ok').webhooks).toBe(true)
@@ -154,7 +161,14 @@ describe('GatewaysModule wiring', () => {
     await mod.init()
 
     const registry = mod.get(ProviderRegistry)
-    expect(registry.registeredGateways()).toEqual(['bank_transfer', 'cod', 'stripe'])
+    expect(registry.registeredGateways()).toEqual([
+      'bank_transfer',
+      'cod',
+      'moyasar',
+      'paymob',
+      'stripe',
+      'tap',
+    ])
 
     await mod.close()
   })

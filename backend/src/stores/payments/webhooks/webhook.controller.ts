@@ -34,9 +34,14 @@ export class WebhookController {
     @Req() request: RawBodyRequest<Request>,
   ) {
     const result = await this.ingestion.ingest({
+      // Passed through and checked against the account's real gateway,
+      // rather than echoed back unverified.
+      gateway,
       accountId,
       rawBody: request.rawBody,
       headers: request.headers as Record<string, string | string[] | undefined>,
+      // Some providers sign in the query string rather than a header.
+      query: request.query as Record<string, string | string[] | undefined>,
     })
 
     return {

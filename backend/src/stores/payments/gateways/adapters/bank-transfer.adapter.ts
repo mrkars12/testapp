@@ -39,9 +39,11 @@ export class BankTransferAdapter implements IPaymentProvider {
     methods: ['bank_transfer'],
     currencies: 'all',
     exponentOverrides: {},
+    automaticCapture: false,
     manualCapture: false,
     partialCapture: false,
     multiCapture: false,
+    refundSupported: false,
     partialRefund: false,
     voidSupported: false,
     authorizationExpiry: false,
@@ -52,6 +54,8 @@ export class BankTransferAdapter implements IPaymentProvider {
     statusPolling: false,
     settlementReports: false,
     webhookResolution: 'none',
+    // The merchant's bank details, which the customer needs to pay at all.
+    nextActionKinds: ['bank_instructions'],
     offlineCommitmentKind: 'awaiting_offline_settlement',
   }
 

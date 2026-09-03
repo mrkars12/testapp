@@ -3,6 +3,7 @@ import type { Mode } from '@prisma/client'
 import { PrismaService } from '../../prisma/prisma.service'
 import { LedgerService } from '../../ledger/ledger.service'
 import { money, toDecimalString } from '../../common/money/money.util'
+import { isPaymentErrorCode, safeFailureMessage } from './gateways/provider.types'
 
 /**
  * ==================================================================
@@ -37,19 +38,25 @@ export class PaymentQueryService {
     const balances = await this.ledger.summary(storeId, mode)
 
     const [unpaidOrders, openIntents, deadLetters] = await Promise.all([
-      this.prisma.guarded().order.count({
-        where: { store_id: storeId, payment_status: 'UNPAID' },
-      }),
-      this.prisma.guarded().paymentIntent.count({
-        where: {
-          store_id: storeId,
-          mode,
-          status: { notIn: ['captured', 'refunded', 'failed', 'cancelled', 'expired'] },
-        },
-      }),
-      this.prisma.guarded().outboxMessage.count({
-        where: { store_id: storeId, mode, status: 'dead' },
-      }),
+      this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+        tx.order.count({
+          where: { store_id: storeId, payment_status: 'UNPAID' },
+        }),
+      ),
+      this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+        tx.paymentIntent.count({
+          where: {
+            store_id: storeId,
+            mode,
+            status: { notIn: ['captured', 'refunded', 'failed', 'cancelled', 'expired'] },
+          },
+        }),
+      ),
+      this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+        tx.outboxMessage.count({
+          where: { store_id: storeId, mode, status: 'dead' },
+        }),
+      ),
     ])
 
     return {
@@ -74,21 +81,23 @@ export class PaymentQueryService {
    * audit events, plus the journal entries that moved money.
    */
   async orderPayment(storeId: bigint, orderId: string, mode: Mode = 'live') {
-    const order = await this.prisma.guarded().order.findFirst({
-      where: { id: BigInt(orderId), store_id: storeId },
-      select: {
-        id: true,
-        order_number: true,
-        status: true,
-        payment_status: true,
-        payment_method: true,
-        currency: true,
-        total: true,
-        paid_at: true,
-        checkout_id: true,
-        created_at: true,
-      },
-    })
+    const order = await this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+      tx.order.findFirst({
+        where: { id: BigInt(orderId), store_id: storeId },
+        select: {
+          id: true,
+          order_number: true,
+          status: true,
+          payment_status: true,
+          payment_method: true,
+          currency: true,
+          total: true,
+          paid_at: true,
+          checkout_id: true,
+          created_at: true,
+        },
+      }),
+    )
 
     if (!order) throw new NotFoundException('Order not found.')
 
@@ -113,19 +122,27 @@ export class PaymentQueryService {
         intent: null,
         attempts: [],
         captures: [],
+        disputes: [],
         events: [],
         journal_entries: [],
       }
     }
 
-    const intent = await this.prisma.guarded().paymentIntent.findFirst({
-      where: {
-        store_id: storeId,
-        mode,
-        context_kind: 'checkout',
-        context_id: order.checkout_id.toString(),
-      },
-    })
+    // Narrowed to a local: TS control-flow narrowing of a property (the
+    // null check above) does not survive into a nested closure, and this
+    // read now runs inside withTenantTransaction's callback.
+    const checkoutId = order.checkout_id
+
+    const intent = await this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+      tx.paymentIntent.findFirst({
+        where: {
+          store_id: storeId,
+          mode,
+          context_kind: 'checkout',
+          context_id: checkoutId.toString(),
+        },
+      }),
+    )
 
     if (!intent) {
       return {
@@ -133,28 +150,43 @@ export class PaymentQueryService {
         intent: null,
         attempts: [],
         captures: [],
+        disputes: [],
         events: [],
         journal_entries: [],
       }
     }
 
-    const [attempts, captures, events, entries] = await Promise.all([
-      this.prisma.guarded().paymentAttempt.findMany({
-        where: { intent_id: intent.id, store_id: storeId },
-        orderBy: { sequence: 'asc' },
-      }),
-      this.prisma.guarded().capture.findMany({
-        where: { intent_id: intent.id, store_id: storeId },
-        orderBy: { id: 'asc' },
-      }),
-      this.prisma.guarded().paymentEvent.findMany({
-        where: { intent_id: intent.id, store_id: storeId },
-        orderBy: { recorded_at: 'asc' },
-      }),
-      this.prisma.guarded().journalEntry.findMany({
-        where: { store_id: storeId, mode, source_kind: 'order', source_id: order.id.toString() },
-        orderBy: { id: 'asc' },
-      }),
+    const [attempts, captures, disputes, events, entries] = await Promise.all([
+      this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+        tx.paymentAttempt.findMany({
+          where: { intent_id: intent.id, store_id: storeId },
+          orderBy: { sequence: 'asc' },
+        }),
+      ),
+      this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+        tx.capture.findMany({
+          where: { intent_id: intent.id, store_id: storeId },
+          orderBy: { id: 'asc' },
+        }),
+      ),
+      this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+        tx.dispute.findMany({
+          where: { intent_id: intent.id, store_id: storeId },
+          orderBy: { id: 'asc' },
+        }),
+      ),
+      this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+        tx.paymentEvent.findMany({
+          where: { intent_id: intent.id, store_id: storeId },
+          orderBy: { recorded_at: 'asc' },
+        }),
+      ),
+      this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+        tx.journalEntry.findMany({
+          where: { store_id: storeId, mode, source_kind: 'order', source_id: order.id.toString() },
+          orderBy: { id: 'asc' },
+        }),
+      ),
     ])
 
     return {
@@ -180,6 +212,10 @@ export class PaymentQueryService {
         // them, so it is safe here and only here.
         next_action_payload: attempt.next_action_payload ?? null,
         error_code: attempt.error_code,
+        failure_message:
+          attempt.error_code && isPaymentErrorCode(attempt.error_code)
+            ? safeFailureMessage(attempt.error_code)
+            : null,
         created_at: attempt.created_at,
       })),
       captures: captures.map((capture) => ({
@@ -190,6 +226,17 @@ export class PaymentQueryService {
         amount: this.format(capture.amount_minor, capture.currency),
         reference: capture.gateway_capture_ref,
         captured_at: capture.captured_at,
+      })),
+      disputes: disputes.map((dispute) => ({
+        id: dispute.id.toString(),
+        status: dispute.status,
+        currency: dispute.currency,
+        amount_minor: dispute.amount_minor.toString(),
+        amount: this.format(dispute.amount_minor, dispute.currency),
+        reason: dispute.reason,
+        reference: dispute.gateway_dispute_ref,
+        opened_at: dispute.opened_at,
+        resolved_at: dispute.resolved_at,
       })),
       events: events.map((event) => ({
         id: event.id.toString(),

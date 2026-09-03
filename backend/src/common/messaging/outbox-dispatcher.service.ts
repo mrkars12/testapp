@@ -138,8 +138,18 @@ export class OutboxDispatcherService implements OnModuleInit, OnModuleDestroy {
    * يحجز دفعة رسايل ذرّياً.
    *
    * ده platform-wide sweep مقصود، لأن العامل لازم يشوف الرسائل
-   * من كل المتاجر. لذلك يتم تشغيل الـraw SQL داخل crossStoreQuery
-   * بدل محاولة فرض tenant scope غير موجود أصلًا في هذا المسار.
+   * من كل المتاجر. لذلك يتم تشغيل الـraw SQL على this.prisma.platform()
+   * — الاتصال اللي مش خاضع لـ RLS أصلًا (نفس الاتصال اللي
+   * PaymentFactApplier بيستخدمه عشان يحل الـ store من حساب دفع قبل ما
+   * الـ tenant يتحدد) — جوه crossStoreQuery عشان السبب يتسجّل ويبقى
+   * قابل للبحث.
+   *
+   * ⚠️ this.prisma (الاتصال الافتراضي) بيشتغل بدور rls_test، وأي
+   * $queryRaw عليه بيخضع لنفس RLS policies زي أي استعلام تاني — تشغيل
+   * الجملة دي على this.prisma من غير tenant context كان معناه إن كل
+   * صف بيترفض ضمنيًا (WHERE يرجع صفر صفوف)، مش بس "استعلام مش محمي".
+   * لا يوجد storeId واحد يتحط بـ withTenantTransaction هنا أصلًا،
+   * لأن الدفعة بتضم رسايل من متاجر مختلفة في نفس الوقت.
    *
    * بياخد:
    *   • الرسايل المعلّقة اللي حان وقتها
@@ -154,7 +164,7 @@ export class OutboxDispatcherService implements OnModuleInit, OnModuleDestroy {
       'platform_sweep',
       'claim pending outbox across stores',
       () =>
-        this.prisma.$queryRaw<
+        this.prisma.platform().$queryRaw<
           {
             id: bigint;
             store_id: bigint;
@@ -264,20 +274,28 @@ export class OutboxDispatcherService implements OnModuleInit, OnModuleDestroy {
     message: OutboxRecord,
     reason: string,
   ): Promise<void> {
-    const result = await this.prisma.guarded().outboxMessage.updateMany({
-      where: {
-        id: message.id,
-        store_id: message.storeId,
-        mode: message.mode,
-      },
-      data: {
-        status: 'published',
-        published_at: new Date(),
-        claimed_by: null,
-        claim_expires_at: null,
-        last_error: reason === 'ok' ? null : reason,
-      },
-    });
+    // Unlike claimBatch(), this message already carries one known
+    // store_id/mode — the row was just claimed above — so the ordinary
+    // per-tenant transaction applies here, one call per message.
+    const result = await this.prisma.withTenantTransaction(
+      message.storeId,
+      message.mode,
+      (tx) =>
+        tx.outboxMessage.updateMany({
+          where: {
+            id: message.id,
+            store_id: message.storeId,
+            mode: message.mode,
+          },
+          data: {
+            status: 'published',
+            published_at: new Date(),
+            claimed_by: null,
+            claim_expires_at: null,
+            last_error: reason === 'ok' ? null : reason,
+          },
+        }),
+    );
 
     if (result.count !== 1) {
       this.logger.warn(
@@ -297,21 +315,26 @@ export class OutboxDispatcherService implements OnModuleInit, OnModuleDestroy {
 
     const nextAttemptAt = new Date(Date.now() + delaySeconds * 1000);
 
-    const result = await this.prisma.guarded().outboxMessage.updateMany({
-      where: {
-        id: message.id,
-        store_id: message.storeId,
-        mode: message.mode,
-      },
-      data: {
-        status: isDead ? 'dead' : 'pending',
-        attempts,
-        next_attempt_at: nextAttemptAt,
-        last_error: error.message.slice(0, 2000),
-        claimed_by: null,
-        claim_expires_at: null,
-      },
-    });
+    const result = await this.prisma.withTenantTransaction(
+      message.storeId,
+      message.mode,
+      (tx) =>
+        tx.outboxMessage.updateMany({
+          where: {
+            id: message.id,
+            store_id: message.storeId,
+            mode: message.mode,
+          },
+          data: {
+            status: isDead ? 'dead' : 'pending',
+            attempts,
+            next_attempt_at: nextAttemptAt,
+            last_error: error.message.slice(0, 2000),
+            claimed_by: null,
+            claim_expires_at: null,
+          },
+        }),
+    );
 
     if (result.count !== 1) {
       this.logger.error(
@@ -338,12 +361,19 @@ export class OutboxDispatcherService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** عدد الرسايل الميتة — للمراقبة والتنبيه */
-  async deadLetterCount(): Promise<number> {
+  /**
+   * عدد الرسايل الميتة — للمراقبة والتنبيه.
+   *
+   * Health checks are platform-wide by design, same reasoning as
+   * claimBatch(): no single store to scope to, so this runs on
+   * this.prisma.platform() rather than guarded()/withTenantTransaction.
+   */
+  async deadLetterCount(eventType?: string): Promise<number> {
     return crossStoreQuery('health_check', 'count dead letters', () =>
-      this.prisma.guarded().outboxMessage.count({
+      this.prisma.platform().outboxMessage.count({
         where: {
           status: 'dead',
+          ...(eventType === undefined ? {} : { event_type: eventType }),
         },
       }),
     );
@@ -359,7 +389,7 @@ export class OutboxDispatcherService implements OnModuleInit, OnModuleDestroy {
       'health_check',
       'count stale pending outbox messages',
       () =>
-        this.prisma.guarded().outboxMessage.count({
+        this.prisma.platform().outboxMessage.count({
           where: {
             status: 'pending',
             created_at: {

@@ -1,5 +1,4 @@
 import { create } from 'zustand'
-import { forceCloseSocket } from '@/components/Go'
 
 export type AuthStatus = 'idle' | 'booting' | 'authenticated' | 'logging_out' | 'unauthenticated' | 'refreshing_session'
 
@@ -12,6 +11,11 @@ interface AuthState {
   logout: () => void
 }
 
+/**
+ * The single client-side auth *status* value. Identity/profile lives in the
+ * React Query `['auth-user']` cache (AuthProvider); this store is only the
+ * coarse state-machine phase that gates render.
+ */
 export const useAuthState = create<AuthState>((set) => ({
   status: 'booting',
   sessionId: null,
@@ -20,13 +24,7 @@ export const useAuthState = create<AuthState>((set) => ({
 
   setSession: (sessionId) => set({ sessionId }),
 
-  logout: () => {
-    forceCloseSocket()
-    set({ status: 'logging_out', sessionId: null })
-  },
+  logout: () => set({ status: 'logging_out', sessionId: null }),
 
-  reset: () => {
-    forceCloseSocket()
-    set({ status: 'unauthenticated', sessionId: null })   // ← غيرناه
-  },
+  reset: () => set({ status: 'unauthenticated', sessionId: null }),
 }))

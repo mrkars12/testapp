@@ -1,0 +1,59 @@
+# ══════════════════════════════════════════════════════════════════
+# Repository-level ignores
+# ══════════════════════════════════════════════════════════════════
+#
+# There was no root .gitignore at all, which is part of why the release
+# state drifted so far: 200MB of archives and a source tarball sat
+# alongside the code with nothing distinguishing them from it, while the
+# entire Round 8 cart module, the Round 9 inventory module and 8 of the
+# 14 migrations were untracked and invisible.
+
+# ── Dependencies ──────────────────────────────────────────────────
+node_modules/
+
+# ── Build output ──────────────────────────────────────────────────
+.next/
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# ── Secrets ───────────────────────────────────────────────────────
+# Belt and braces: backend/.gitignore already ignores .env, and this
+# makes it true for every directory rather than one.
+.env
+.env.*
+!.env.example
+
+# ── Archives and vendored installers ──────────────────────────────
+# Never part of a release. The ones that were tracked (awscliv2.zip at
+# 70MB, plus dist/src/stores snapshots from May–June 2026 long
+# superseded by the working tree) are untracked by this change; the
+# files themselves are left on disk rather than deleted.
+*.zip
+*.tar.gz
+*.tgz
+*.7z
+
+# ── Database dumps and backups ────────────────────────────────────
+# A production dump in a repository is a data-protection incident
+# waiting for someone to clone it.
+*.dump
+neon-backup*.sql
+backup.sql
+
+# ── Local logs and OS noise ───────────────────────────────────────
+*.log
+.DS_Store
+
+# ── Large browser-evidence captures ───────────────────────────────
+# 14MB of PNG screenshots from earlier investigation rounds. Evidence,
+# not release content.
+payment-browser-evidence/
+
+# NOTE, deliberately NOT ignored: the working-note directories
+# (01/, 02/, 3/, report/, ي/) that hold the Round 5–10 reports and
+# audits. They are left UNTRACKED and VISIBLE in `git status` rather
+# than hidden, so that whoever commits this decides consciously whether
+# project history belongs in the repository. Hiding them would repeat
+# the mistake this file exists to fix.

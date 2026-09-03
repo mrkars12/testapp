@@ -7,6 +7,7 @@ import type { Response } from 'express'; // 🚩 ضروري جداً إضافة 
 import { OptionalJwtAuthGuard } from './optional-jwt-auth.guard'
 import { SessionAuthGuard } from './session-auth.guard'
 import { ClearCacheInterceptor } from './clear-cache.interceptor';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 
 
 @Controller('auth')
@@ -81,7 +82,8 @@ async login(
 }
 
 @Post('forgot-password')
-
+@UseGuards(ThrottlerGuard)
+@Throttle({ default: { limit: 5, ttl: 900_000 } })
 async forgotPassword(
 
   @Body('email')
@@ -143,6 +145,8 @@ async resendOtp(
     )
 }
   @Post('device/verify-code')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 300_000 } })
   async verifyDevice(
     @Body() body: any, 
     @Headers('user-agent') ua: string, 
@@ -161,6 +165,8 @@ async resendOtp(
   }
 
   @Post('device/resend-code')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 3, ttl: 300_000 } })
 
 async resendDeviceCode(
   @Body() body: any
@@ -405,12 +411,16 @@ if (
 
   // 4. فحص البريد (تم نقل المنطق للـ Service لإصلاح خطأ this.prisma)
   @Post('check-email')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   async checkEmail(@Body('email') email: string) {
     return this.authService.isEmailAvailable(email);
   }
 
   // 5. فحص اسم المستخدم (تم نقل المنطق للـ Service لإصلاح خطأ this.prisma)
   @Post('check-username')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   async checkUsername(@Body('username') username: string) {
     return this.authService.isUsernameAvailable(username);
   }
@@ -476,7 +486,7 @@ async heartbeat(@Req() req: any) {
 
     return {
       authenticated: true,
-      user: req.user,
+      user: this.authService.sanitizeUser(req.user),
       session_id: req.user.session_id
     }
   }

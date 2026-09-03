@@ -15,8 +15,8 @@ const PROVIDER_KEYS = [
 
 // enum PaymentMethodKey values declared in schema.prisma
 const METHOD_KEYS = [
-  'card','mada','knet','benefit','apple_pay','google_pay','wallet','kiosk',
-  'bank_transfer','cod','bnpl',
+  'card','mada','knet','benefit','apple_pay','google_pay','stc_pay','wallet',
+  'kiosk','bank_transfer','cod','bnpl',
 ]
 
 describe('gateway catalog', () => {

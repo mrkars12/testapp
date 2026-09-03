@@ -12,17 +12,65 @@ import {
 
 import { Server, Socket } from 'socket.io'
 import { OnEvent } from '@nestjs/event-emitter'
+import { JwtService } from '@nestjs/jwt'
+import { parse as parseCookie } from 'cookie'
+import { buildCorsOriginChecker } from '../common/config/cors-origin-matcher'
+
+/**
+ * Must match the HTTP CORS allowlist in main.ts exactly (same env var,
+ * same default, same matcher) — a hardcoded single origin here silently
+ * rejects the real deployed frontend origin (e.g. a Codespaces/`*.github.dev`
+ * host) even when HTTP CORS is configured correctly, which is exactly what
+ * produced the "socket connect error" this fixes.
+ */
+const isAllowedSocketOrigin = buildCorsOriginChecker(
+  (process.env.CORS_ORIGINS ?? 'http://localhost:3000,*.localhost:3000')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+)
 
 @WebSocketGateway({
   cors: {
-    origin: 'http://localhost:3000', // رابط فرونت إند Next.js
+    origin: (origin, callback) => {
+      callback(null, isAllowedSocketOrigin(origin))
+    },
     credentials: true
   }
 })
 export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
+  constructor(private readonly jwtService: JwtService) {}
+
   @WebSocketServer()
   server: Server
+
+  /**
+   * ⚠️ يتحقق من هوية العميل من الـ access_token cookie نفسه المستخدم في
+   * كل الـ HTTP requests — مش من أي بيانات بيبعتها العميل في رسالة الـ
+   * socket. من غيره أي حد يقدر يفتح اتصال socket ويبعت أي userId في
+   * حدث 'auth' وينضم لغرفة user:<id> بتاعت حد تاني، ويستقبل كل
+   * إشعاراته (بما فيها payment_event) وهو مش مسجّل دخول أصلاً كـ
+   * المستخدم ده. الـ userId الوحيد الموثوق هو اللي طالع من التوكن
+   * الموقّع، مش اللي العميل بيدّعيه.
+   */
+  private verifySocketUserId(client: Socket): string | null {
+    const cookieHeader = client.handshake.headers.cookie
+    if (!cookieHeader) return null
+
+    const token = parseCookie(cookieHeader)['access_token']
+    if (!token) return null
+
+    try {
+      const payload = this.jwtService.verify(token, {
+        secret: process.env.JWT_SECRET,
+      }) as { sub?: string }
+
+      return payload.sub ? String(payload.sub) : null
+    } catch {
+      return null
+    }
+  }
 
   /**
    * =================================
@@ -37,6 +85,9 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
    * =================================
    */
   handleConnection(client: Socket) {
+    // Verified once at connection time and trusted for the rest of this
+    // socket's lifetime — never re-derived from client-supplied payloads.
+    client.data.verifiedUserId = this.verifySocketUserId(client)
     console.log('🌐 [SOCKET CONNECTED]:', client.id)
   }
 
@@ -89,8 +140,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       return
     }
 
+    // السماح بالانضمام لغرفة user:<id> فقط لو الـ id ده مطابق للهوية
+    // اللي اتأكّدنا منها من الـ access_token الحقيقي وقت الاتصال —
+    // مش أي id بيبعته العميل في رسالة الـ socket نفسها.
+    const verifiedUserId = client.data.verifiedUserId as string | null
+    if (!verifiedUserId || verifiedUserId !== String(data.userId).trim()) {
+      console.error('❌ [AUTH FAILED]: Unverified or mismatched userId — refusing room join')
+      client.emit('socket_authenticated', { success: false })
+      return
+    }
+
     // تحويل صارم ونقي للنصوص لمنع مشاكل الـ Types
-    const userIdStr = String(data.userId).trim()
+    const userIdStr = verifiedUserId
     const deviceIdStr = String(data.deviceId).trim()
 
     // الانضمام إلى غرف البث الصلبة
@@ -229,6 +290,6 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   @OnEvent('device.deleted')
   handleDeviceDeleted(payload: { deviceId: string; userId: string }) {
     console.log('🗑️ [DEVICE DELETED]:', payload)
-    this.forceLogoutDevice(payload.userId, payload.deviceId, '/dashboard')
+    this.forceLogoutDevice(payload.userId, payload.deviceId, '/verify-email')
   }
 }

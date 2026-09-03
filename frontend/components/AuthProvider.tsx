@@ -16,9 +16,9 @@ import { useDevicesStore } from '@/lib/device'
 import Cookies from 'js-cookie'
 import { getHardwareFingerprint } from '@/lib/fingerprint'
 import { useAuthState } from '@/lib/authState'
+import { AUTH_TAB_ID } from '@/lib/auth-tab-id'
+import { authedHome, resetStoreBootstrap } from '@/lib/storeBootstrap'
 import { socket } from '@/lib/socket'
-import { authChannel }
-from '@/lib/auth-channel'
 import { useIdleLogout } from '@/lib/useIdleLogout'  // ← أضف
 import { flushSync }
 from 'react-dom'
@@ -28,9 +28,15 @@ interface User {
   fullname: string | null;
   email: string;
   username: string;
+  first_name?: string | null;
+  last_name?: string | null;
+  phone?: string | null;
   two_factor_enabled?: boolean;
   email_verified_at: string | null;
   accounttype: 'individual' | 'business';
+  /** false for a social-login account that never set a password (Part 10) — used by the
+   *  first-store/onboarding form to decide whether to also collect a password. */
+  has_password?: boolean;
 }
 
 interface AuthData {
@@ -50,7 +56,9 @@ interface AuthContextType {
   isAuthenticated: boolean;
   isSessionReady: boolean;
   login: (email: string, password: string, captchaToken?: string | null, timezone?: string, fingerprint?: string, hardwareFingerprint?: string) => Promise<any>;
-  logout: (isForce?: boolean, intendedPath?: string) => Promise<void>;
+  /** The ONE logout. No args — an explicit logout always lands on a clean
+   *  `/login` (no `intended`) and resets per-user client state. */
+  logout: () => Promise<void>;
   refreshUser: () => Promise<User | null>;
   register: (formData: any, flowToken?: string | null, flowSignature?: string | null) => Promise<any>;
 }
@@ -90,7 +98,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
 
 
-const isPublicStorePage = pathname?.startsWith('/store');
+// The PUBLIC customer storefront lives at `/stores/[slug]` (plural) — a
+// distinct, unauthenticated route tree from the merchant admin at
+// `/store/[storeSlug]` (singular), which is fully protected. This used to
+// check the `/store` prefix, from when the bare `/store/[slug]` WAS the
+// public storefront; since the route-split it silently matched the entire
+// protected merchant dashboard instead, disabling idle-timeout logout for
+// every merchant page — the opposite of what it was meant to do.
+const isPublicStorePage = pathname?.startsWith('/stores/');
 
 // 2. تفعيل خطاف الخمول فقط إذا كان مسجل الدخول، ولم يكن في صفحة المتجر العامة
 useIdleLogout(status === 'authenticated' && !isPublicStorePage);
@@ -263,33 +278,21 @@ const logout = useCallback(async () => {
   const authState = useAuthState.getState()
 
   /**
-   * =================================
-   * ✅ حفظ المسار الحالي
-   * =================================
+   * An explicit logout is an ACCOUNT BOUNDARY. We do NOT carry the current
+   * path forward as `intended` — the next person to log in here may be a
+   * different user, and "resume where User A was" must never leak into
+   * User B's session (a foreign `/store/<A>` deep link, a stale
+   * `originalStore`, etc). Post-logout state is deliberately clean:
+   * `/login`, no query, and the shared store bootstrap wiped.
    */
-  let intended =
-    window.location.pathname +
-    window.location.search
 
-  if (
-    intended.startsWith('/login') ||
-    intended.startsWith('/register')
-  ) {
-    intended = '/dashboard'
-  }
-
-  /**
-   * =================================
-   * ✅ تحويل الحالة فوراً لزائر
-   * =================================
-   */
   flushSync(() => {
     authState.setSession(null)
   })
 
   /**
    * =================================
-   * ✅ تنظيف React Query
+   * ✅ تنظيف React Query + store context
    * =================================
    */
   try {
@@ -304,6 +307,10 @@ const logout = useCallback(async () => {
     )
 
   } catch {}
+
+  // Wipe the previous user's store list / original-store so it can never
+  // resolve a destination for whoever logs in next.
+  resetStoreBootstrap()
 
   /**
    * =================================
@@ -341,29 +348,29 @@ const logout = useCallback(async () => {
     clearClientCookies()
   } catch {}
 
+
   /**
-   * =================================
-   * ✅ بث الخروج للتابات الأخرى
-   * =================================
-   */
+    * =================================
+    * ✅ بث الخروج للتابات الأخرى
+    * =================================
+    */
   try {
     const bc = new BroadcastChannel(
       'auth_sync_channel'
     )
 
     bc.postMessage({
-      type: 'AUTH_LOGOUT_EVENT',
-      intendedPath: intended
+      type: 'AUTH_LOGOUT_EVENT'
     })
 
     bc.close()
   } catch {}
 
   /**
-   * =================================
-   * ✅ طلب logout من السيرفر
-   * =================================
-   */
+    * =================================
+    * ✅ طلب logout من السيرفر
+    * =================================
+    */
   try {
     await fetch(
       `${
@@ -372,7 +379,14 @@ const logout = useCallback(async () => {
       }/auth/logout`,
       {
         method: 'POST',
-        credentials: 'include'
+        credentials: 'include',
+        // The backend's cookie-CSRF guard (common/csrf-protection.middleware.ts)
+        // 403s any authenticated POST whose Content-Type isn't
+        // application/json. A bodyless fetch sends no Content-Type, so this
+        // request was being rejected and the server session cookie never
+        // cleared — logout was cosmetic (client state only).
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
       }
     )
   } catch {}
@@ -383,11 +397,7 @@ const logout = useCallback(async () => {
    * =================================
    */
   startTransition(() => {
-    router.replace(
-      `/login?intended=${encodeURIComponent(
-        intended
-      )}`
-    )
+    router.replace('/login')
   })
 
   /**
@@ -450,6 +460,16 @@ const login = async (
     // اسحب المستخدم الحقيقي بعد حفظ الكوكي
     const { data } = await api.get('/auth/me')
 
+    // ACCOUNT BOUNDARY: if this login is a DIFFERENT user than whatever
+    // was last cached in this tab (a re-login without an intervening
+    // logout, e.g. session expiry then straight back in as someone else),
+    // drop the previous user's store list before anything routes off it.
+    const prevUserId =
+      queryClient.getQueryData<AuthData>(['auth-user'])?.user?.id ?? null
+    if (prevUserId && String(prevUserId) !== String(data?.user?.id ?? '')) {
+      resetStoreBootstrap()
+    }
+
     queryClient.setQueryData(
       ['auth-user'],
       data
@@ -463,7 +483,11 @@ const login = async (
       data.session_id
     )
 
-    router.replace('/dashboard')
+    // Navigation is the CALLER's job (LoginClient's `handleAuthSuccess`,
+    // which resolves zero/one/multi-store via `resolvePostAuthTarget()`)
+    // — this used to `router.replace('/dashboard')` right here, which fired
+    // before that resolution even started, so every login flashed
+    // `/dashboard` and then hopped again once the real target resolved.
   }
 
   return result
@@ -499,6 +523,16 @@ const register = async (formData: any, flowToken?: string | null, flowSignature?
 
       if (data?.type === 'AUTH_LOGIN_SYNC') {
 
+        // BroadcastChannel delivers to other channel objects in the SAME
+        // tab too. The tab that just logged in already navigated itself
+        // (LoginClient.handleAuthSuccess / RegisterStep2Client /
+        // OAuthSuccessClient); if this handler also runs here it fires a
+        // second, delayed `router.replace` that lands after the user has
+        // moved on to the chooser or a store and bounces them back to
+        // `/select-store`. Ignore our own broadcast; real cross-tab sync
+        // carries a different `senderId`.
+        if (data.senderId && data.senderId === AUTH_TAB_ID) return
+
         /**
          * =================================
          * ✅ تنظيف flows القديمة
@@ -511,6 +545,17 @@ const register = async (formData: any, flowToken?: string | null, flowSignature?
           sessionStorage.removeItem(
             'oauth_msg'
           )
+        }
+
+        // ACCOUNT BOUNDARY: another tab logged in. If it is a DIFFERENT
+        // user than this tab currently has cached, wipe this tab's
+        // per-user routing state (store list / original store) so the
+        // destination is resolved purely from the new identity.
+        const prevAuth = queryClient.getQueryData<AuthData>(['auth-user'])
+        const prevUserId = prevAuth?.user?.id ?? null
+        const nextUserId = data.userPayload?.user?.id ?? null
+        if (prevUserId && nextUserId && String(prevUserId) !== String(nextUserId)) {
+          resetStoreBootstrap()
         }
 
         /**
@@ -530,13 +575,26 @@ const register = async (formData: any, flowToken?: string | null, flowSignature?
          * =================================
          * ✅ حقن أولي سريع
          * =================================
+         *
+         * Non-downgrading merge: the cross-tab payload can be the thin
+         * login-response `user`. Never let a known `email_verified_at`
+         * (from an earlier `/auth/me` in this tab) regress to null, or
+         * this tab briefly treats a verified account as unverified.
          */
-        queryClient.setQueryData(
+        queryClient.setQueryData<AuthData>(
           ['auth-user'],
-          {
-            authenticated: true,
-            user: data.userPayload.user,
-            session_id: data.userPayload.session_id
+          (prev) => {
+            const prevUser = prev?.user ?? null
+            const incoming = data.userPayload?.user ?? null
+            const nextUser = { ...(prevUser ?? {}), ...(incoming ?? {}) } as User
+            if (nextUser.email_verified_at == null && prevUser?.email_verified_at != null) {
+              nextUser.email_verified_at = prevUser.email_verified_at
+            }
+            return {
+              authenticated: true,
+              user: nextUser,
+              session_id: data.userPayload?.session_id ?? prev?.session_id ?? undefined,
+            }
           }
         )
 
@@ -571,28 +629,31 @@ const register = async (formData: any, flowToken?: string | null, flowSignature?
          * ✅ target
          * =================================
          */
-        let target =
-          data.intendedPath ||
-          '/dashboard'
-
-        if (
-          target === '/' ||
-          target.includes('/login')
-        ) {
-          target = '/dashboard'
-        }
+        // Cross-tab: another tab just logged in. `authedHome` is the ONE
+        // resolver — it validates the intended path (safe, not an auth
+        // route, owned store) and otherwise runs account-switch resolution
+        // (chooser allowed). No local re-checking of the path here.
+        const target = await authedHome('account-switch', data.intendedPath)
 
         /**
          * =================================
          * ✅ redirect فقط من الصفحات العامة
          * =================================
+         *
+         * Read the LIVE pathname, not the `pathname` captured when this
+         * effect last ran: this handler is async (`await /auth/me`), so a
+         * stale closure could still say "/login" after the user has
+         * already navigated into the app — and then this would drag them
+         * back out to the chooser.
          */
+        const livePath =
+          typeof window !== 'undefined' ? window.location.pathname : pathname
         const isPublicPage =
-          pathname === '/' ||
-          pathname.startsWith('/login') ||
-          pathname.startsWith('/register')
+          livePath === '/' ||
+          livePath.startsWith('/login') ||
+          livePath.startsWith('/register')
 
-        if (isPublicPage) {
+        if (isPublicPage && livePath + window.location.search !== target) {
 
           startTransition(() => {
 
@@ -644,10 +705,10 @@ const register = async (formData: any, flowToken?: string | null, flowSignature?
         )
 
         /**
-         * =================================
-         * ✅ تنظيف listeners فقط
-         * =================================
-         */
+          * =================================
+          * ✅ تنظيف listeners فقط
+          * =================================
+          */
         socket.off('force_logout')
         socket.off('device_logged_in')
         socket.off('device_logged_out')
@@ -675,44 +736,17 @@ const register = async (formData: any, flowToken?: string | null, flowSignature?
           'oauth_msg'
         )
 
-        /**
-         * =================================
-         * ✅ intended path
-         * =================================
-         */
-        let cleanPath =
-          data.intendedPath || '/dashboard'
+        // ACCOUNT BOUNDARY (see `logout` above): wipe this tab's per-user
+        // store state and go to a clean `/login` with no `intended`.
+        resetStoreBootstrap()
 
-        if (
-          cleanPath.startsWith('/login') ||
-          cleanPath.startsWith('/register')
-        ) {
-          cleanPath = '/dashboard'
-        }
-
-        const finalRedirectTarget =
-          `/login?intended=${encodeURIComponent(
-            cleanPath
-          )}`
-
-        /**
-         * =================================
-         * ✅ منع تجمد التابة
-         * =================================
-         */
         requestAnimationFrame(() => {
-
           startTransition(() => {
-
-            router.replace(
-              finalRedirectTarget
-            )
-
+            router.replace('/login')
           })
-
         })
       }
-    
+
       if (data?.type === 'AUTH_FORCE_LOGOUT_SYNC') {
 
         flushSync(() => {
@@ -726,40 +760,10 @@ const register = async (formData: any, flowToken?: string | null, flowSignature?
         socket.disconnect()
         socket.roomsJoined = false
 
-        const currentPath =
-
-          window.location.pathname +
-
-          window.location.search
-
-        let cleanPath =
-
-          currentPath ||
-
-          '/dashboard'
-
-        if (
-
-          cleanPath.startsWith('/login') ||
-
-          cleanPath.startsWith('/register') ||
-
-          cleanPath.includes('redirect') ||
-
-          cleanPath === '/'
-        ) {
-
-          cleanPath = '/dashboard'
-        }
-
-        const finalRedirectTarget =
-
-          `/login?intended=${encodeURIComponent(cleanPath)}`
+        resetStoreBootstrap()
 
         if (typeof window !== 'undefined') {
-          // 🔥 [الضربة القاضية]: تحويل صلب لتطهير الميموري والتابات الميتة
-          router.replace(finalRedirectTarget);
-
+          router.replace('/login')
         }
       }
     }
@@ -928,7 +932,7 @@ const register = async (formData: any, flowToken?: string | null, flowSignature?
         rawIntendedPath.startsWith('/register')
       ) {
 
-        rawIntendedPath = '/dashboard'
+        rawIntendedPath = '/verify-email'
       }
    
       // تجهيز الرابط النهائي الموحد للتابتين
@@ -1015,7 +1019,7 @@ useEffect(() => {
 
     const intendedPath =
       event.detail?.intendedPath ||
-      '/dashboard'
+      '/verify-email'
 
     const targetUrl =
       event.detail?.url ||
@@ -1133,6 +1137,30 @@ useEffect(() => {
 
     const reason = (e as CustomEvent).detail?.reason || 'session_expired'
     const isTimeout = reason === 'idle_timeout'
+
+    // A LONE 401 from a background API call (notifications / balance /
+    // devices / an /auth/me race) is not proof the session died. Re-verify
+    // against /auth/me before tearing anything down; if it still says
+    // authenticated, the 401 was transient — do nothing. An explicit idle
+    // timeout is trusted and skips this check.
+    if (!isTimeout) {
+      try {
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_API_URL}/auth/me`,
+          { credentials: 'include' },
+        )
+        if (res.ok) {
+          const d = await res.json().catch(() => null)
+          if (d?.authenticated) {
+            queryClient.setQueryData(['auth-user'], d)
+            return
+          }
+        }
+      } catch {
+        // network error re-verifying — fall through to logout (safer).
+      }
+    }
+
     const intendedPath = window.location.pathname + window.location.search
 
     // ✅ قفل فوري
@@ -1155,7 +1183,11 @@ socket.off('devices_updated')
     `${process.env.NEXT_PUBLIC_API_URL}/auth/logout`,
     {
       method: 'POST',
-      credentials: 'include'
+      credentials: 'include',
+      // Must send application/json or the backend cookie-CSRF guard 403s
+      // this authenticated POST and the session cookie is never cleared.
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
     }
   )
 } catch {}
@@ -1163,6 +1195,10 @@ socket.off('devices_updated')
     await queryClient.cancelQueries()
 
 queryClient.clear()
+
+// Confirmed-dead session is an identity boundary too — clear per-user
+// store state so a different user logging in here resolves from scratch.
+resetStoreBootstrap()
 
 clearClientCookies()
 
@@ -1173,15 +1209,16 @@ clearClientCookies()
       bc.close()
     } catch {}
 
-    // ✅ redirect فوري بدون requestAnimationFrame
-    const reasonParam = isTimeout ? '&reason=timeout' : ''
-    // router.replace(
-    //   `/login?intended=${encodeURIComponent(intendedPath)}${reasonParam}`
-    // )
-
-    window.location.replace(
-      `/login?reason=timeout&intended=${encodeURIComponent(intendedPath)}`
-    )
+    // Soft navigation via the app router (not `window.location.replace`):
+    // the cache/socket/cookies were already torn down above, so a hard
+    // page reload buys nothing and only makes the transition janky. Keep
+    // `reason=timeout` so `middleware.ts` / `PublicAuthGuard` don't bounce
+    // the fresh `/login` back.
+    startTransition(() => {
+      router.replace(
+        `/login?reason=timeout&intended=${encodeURIComponent(intendedPath)}`,
+      )
+    })
   }
 
   window.addEventListener('auth:session_expired', handleSessionExpired)

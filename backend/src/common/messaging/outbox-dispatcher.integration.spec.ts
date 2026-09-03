@@ -1,6 +1,6 @@
 import { ConfigService } from '@nestjs/config'
 import { SchedulerRegistry } from '@nestjs/schedule'
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient, Prisma } from '@prisma/client'
 import { ConsumedEventService } from './consumed-event.service'
 import { OutboxDispatcherService } from './outbox-dispatcher.service'
 import { OutboxHandlerRegistry } from './outbox-handler.registry'
@@ -63,13 +63,38 @@ class RecordingHandler implements OutboxHandler {
   }
 }
 
+/**
+ * `outbox_messages` and `consumed_events` are RLS-enabled
+ * (test/global-setup.ts): the raw `rls_test` client this spec holds can
+ * only read or write them once `app.store_id`/`app.mode` are installed
+ * on the same transaction — exactly what `OutboxDispatcherService` and
+ * `ConsumedEventService` themselves now do via `withTenantTransaction`
+ * for their own per-message operations. Fixture setup and assertions
+ * that reach these tables directly need the same context.
+ */
+async function withTenant<T>(
+  prisma: PrismaClient,
+  storeId: bigint,
+  mode: string,
+  cb: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`
+      SELECT
+        set_config('app.store_id', ${storeId.toString()}, true),
+        set_config('app.mode', ${mode}, true)
+    `
+    return cb(tx as Prisma.TransactionClient)
+  })
+}
+
 async function seed(
   prisma: PrismaClient,
   outbox: OutboxService,
   eventType: string,
 ) {
   let id!: bigint
-  await prisma.$transaction(async (tx) => {
+  await withTenant(prisma, STORE, 'live', async (tx) => {
     id = await outbox.emit(tx, {
       storeId: STORE,
       mode: 'live',
@@ -121,7 +146,9 @@ describe('OutboxDispatcherService (integration)', () => {
     expect(processed).toBe(1)
     expect(handler.seen).toEqual([id])
 
-    const stored = await prisma.outboxMessage.findFirst({ where: { id } })
+    const stored = await withTenant(prisma, STORE, 'live', (tx) =>
+      tx.outboxMessage.findFirst({ where: { id } }),
+    )
     expect(stored?.status).toBe('published')
     expect(stored?.published_at).not.toBeNull()
   })
@@ -130,7 +157,9 @@ describe('OutboxDispatcherService (integration)', () => {
     const id = await seed(prisma, outbox, 'nobody.listens')
     await dispatcher.dispatchBatch()
 
-    const stored = await prisma.outboxMessage.findFirst({ where: { id } })
+    const stored = await withTenant(prisma, STORE, 'live', (tx) =>
+      tx.outboxMessage.findFirst({ where: { id } }),
+    )
     expect(stored?.status).toBe('published')
     expect(stored?.last_error).toBe('no_handlers')
   })
@@ -143,10 +172,12 @@ describe('OutboxDispatcherService (integration)', () => {
     await dispatcher.dispatchBatch()
 
     // نرجّعها معلّقة يدوياً — بيحاكي إعادة تسليم
-    await prisma.outboxMessage.updateMany({
-      where: { id },
-      data: { status: 'pending', published_at: null },
-    })
+    await withTenant(prisma, STORE, 'live', (tx) =>
+      tx.outboxMessage.updateMany({
+        where: { id },
+        data: { status: 'pending', published_at: null },
+      }),
+    )
 
     await dispatcher.dispatchBatch()
 
@@ -188,9 +219,11 @@ describe('OutboxDispatcherService (integration)', () => {
       expect(allSeen).toHaveLength(20)
       expect(new Set(allSeen).size).toBe(20)
 
-      const consumedRows = await prisma.consumedEvent.count({
-        where: { consumer_name: 'consumer.a' },
-      })
+      const consumedRows = await withTenant(prisma, STORE, 'live', (tx) =>
+        tx.consumedEvent.count({
+          where: { consumer_name: 'consumer.a' },
+        }),
+      )
       expect(consumedRows).toBe(20)
     } finally {
       await second.$disconnect()
@@ -200,14 +233,16 @@ describe('OutboxDispatcherService (integration)', () => {
   it('reclaims a message whose lease expired', async () => {
     const id = await seed(prisma, outbox, 'spec.event')
 
-    await prisma.outboxMessage.updateMany({
-      where: { id },
-      data: {
-        status: 'claimed',
-        claimed_by: 'dead-worker',
-        claim_expires_at: new Date(Date.now() - 60_000),
-      },
-    })
+    await withTenant(prisma, STORE, 'live', (tx) =>
+      tx.outboxMessage.updateMany({
+        where: { id },
+        data: {
+          status: 'claimed',
+          claimed_by: 'dead-worker',
+          claim_expires_at: new Date(Date.now() - 60_000),
+        },
+      }),
+    )
 
     const handler = new RecordingHandler('spec.consumer')
     registry.register('spec.event', handler)
@@ -219,14 +254,16 @@ describe('OutboxDispatcherService (integration)', () => {
   it('does not touch a message whose lease is still valid', async () => {
     const id = await seed(prisma, outbox, 'spec.event')
 
-    await prisma.outboxMessage.updateMany({
-      where: { id },
-      data: {
-        status: 'claimed',
-        claimed_by: 'busy-worker',
-        claim_expires_at: new Date(Date.now() + 60_000),
-      },
-    })
+    await withTenant(prisma, STORE, 'live', (tx) =>
+      tx.outboxMessage.updateMany({
+        where: { id },
+        data: {
+          status: 'claimed',
+          claimed_by: 'busy-worker',
+          claim_expires_at: new Date(Date.now() + 60_000),
+        },
+      }),
+    )
 
     expect(await dispatcher.dispatchBatch()).toBe(0)
   })
@@ -242,13 +279,17 @@ describe('OutboxDispatcherService (integration)', () => {
     const id = await seed(prisma, outbox, 'spec.event')
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
-      await prisma.outboxMessage.updateMany({
-        where: { id },
-        data: { next_attempt_at: new Date(Date.now() - 1000) },
-      })
+      await withTenant(prisma, STORE, 'live', (tx) =>
+        tx.outboxMessage.updateMany({
+          where: { id },
+          data: { next_attempt_at: new Date(Date.now() - 1000) },
+        }),
+      )
       await dispatcher.dispatchBatch()
 
-      const stored = await prisma.outboxMessage.findFirst({ where: { id } })
+      const stored = await withTenant(prisma, STORE, 'live', (tx) =>
+        tx.outboxMessage.findFirst({ where: { id } }),
+      )
       expect(stored?.attempts).toBe(attempt)
       expect(stored?.last_error).toContain('handler exploded')
 
@@ -276,7 +317,11 @@ describe('OutboxDispatcherService (integration)', () => {
     // المحاولة الجاية في المستقبل → الدورة دي المفروض متلقطهاش
     expect(await dispatcher.dispatchBatch()).toBe(0)
     expect(
-      (await prisma.outboxMessage.findFirst({ where: { id } }))?.attempts,
+      (
+        await withTenant(prisma, STORE, 'live', (tx) =>
+          tx.outboxMessage.findFirst({ where: { id } }),
+        )
+      )?.attempts,
     ).toBe(1)
   })
 
@@ -289,10 +334,12 @@ describe('OutboxDispatcherService (integration)', () => {
 
   it('reports stale pending messages', async () => {
     const id = await seed(prisma, outbox, 'spec.event')
-    await prisma.outboxMessage.updateMany({
-      where: { id },
-      data: { created_at: new Date(Date.now() - 3_600_000) },
-    })
+    await withTenant(prisma, STORE, 'live', (tx) =>
+      tx.outboxMessage.updateMany({
+        where: { id },
+        data: { created_at: new Date(Date.now() - 3_600_000) },
+      }),
+    )
 
     expect(await dispatcher.stalePendingCount(300)).toBe(1)
   })

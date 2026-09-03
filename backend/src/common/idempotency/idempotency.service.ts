@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { ConflictException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { Prisma } from '@prisma/client';
@@ -74,9 +74,8 @@ export class IdempotencyService {
     const lockedUntil = new Date(now.getTime() + request.leaseSeconds * 1000);
 
     try {
-      const created = await this.prisma
-        .guarded()
-        .paymentIdempotencyRecord.create({
+      const created = await this.prisma.withTenantTransaction(request.storeId, request.mode, (tx) =>
+        tx.paymentIdempotencyRecord.create({
           data: {
             store_id: request.storeId,
             mode: request.mode,
@@ -90,7 +89,8 @@ export class IdempotencyService {
           select: {
             id: true,
           },
-        });
+        }),
+      );
 
       return {
         outcome: 'proceed',
@@ -102,6 +102,93 @@ export class IdempotencyService {
       }
 
       return this.resolveExisting(request, now, lockedUntil);
+    }
+  }
+
+  /**
+   * ينفّذ عملية مرة واحدة بالظبط تحت مفتاح معيّن.
+   *
+   * Wraps the claim → run → complete/fail sequence that every
+   * idempotent mutation needs, so five call sites do not each re-derive
+   * it (and each get a subtly different corner wrong). This is not a
+   * second mechanism: it drives the same claim(), the same
+   * PaymentIdempotencyRecord table, and the same unique constraint that
+   * is the actual guarantee.
+   *
+   * `idempotencyKey` undefined means the caller sent no key — the
+   * operation runs unprotected, exactly as it did before. Idempotency is
+   * opt-in per request, not mandatory.
+   *
+   * ⚠️ لازم يتنادى برّه أي transaction للمستدعي — زي claim() نفسها.
+   */
+  async runExclusive<T>(
+    request: {
+      readonly storeId: bigint;
+      readonly mode: ClaimRequest['mode'];
+      readonly scope: string;
+      readonly idempotencyKey?: string;
+      readonly fingerprint: string;
+      readonly ttlSeconds?: number;
+      readonly leaseSeconds?: number;
+    },
+    operation: () => Promise<T>,
+    options: { readonly statusCode?: number; readonly inFlightMessage?: string } = {},
+  ): Promise<T> {
+    if (!request.idempotencyKey) {
+      return operation();
+    }
+
+    const claim = await this.claim({
+      storeId: request.storeId,
+      mode: request.mode,
+      scope: request.scope,
+      idempotencyKey: request.idempotencyKey,
+      fingerprint: request.fingerprint,
+      ttlSeconds: request.ttlSeconds ?? this.defaultTtlSeconds,
+      leaseSeconds: request.leaseSeconds ?? this.defaultLeaseSeconds,
+    });
+
+    if (claim.outcome === 'conflict') {
+      throw new ConflictException(claim.detail);
+    }
+
+    if (claim.outcome === 'in_flight') {
+      throw new ConflictException(
+        options.inFlightMessage ??
+          'The same request is still being processed. Please wait a moment and try again.',
+      );
+    }
+
+    if (claim.outcome === 'replay') {
+      // Comes back through JSON, so it is the stored shape rather than
+      // the live object the first caller got. Every operation wrapped
+      // here returns plain strings for that reason.
+      return claim.body as T;
+    }
+
+    try {
+      const result = await operation();
+
+      await this.complete(
+        claim.recordId,
+        request.storeId,
+        request.mode,
+        options.statusCode ?? 200,
+        result,
+      );
+
+      return result;
+    } catch (error) {
+      // A failed operation must leave the key retryable rather than
+      // poisoned: fail() sets status=failed, and a later claim with the
+      // same key steals the lease instead of replaying a result that
+      // never existed. Swallowing this bookkeeping error is deliberate —
+      // the operation's own error is the one the caller needs.
+      await this.fail(claim.recordId, request.storeId, request.mode).catch(
+        () => undefined,
+      );
+
+      throw error;
     }
   }
 
@@ -118,27 +205,29 @@ export class IdempotencyService {
     statusCode: number,
     body: unknown,
   ): Promise<void> {
-    await this.prisma.guarded().paymentIdempotencyRecord.updateMany({
-      where: {
-        id: recordId,
-        store_id: storeId,
-        mode,
-      },
-      data: {
-        status: 'completed',
-        response_status_code: statusCode,
+    await this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+      tx.paymentIdempotencyRecord.updateMany({
+        where: {
+          id: recordId,
+          store_id: storeId,
+          mode,
+        },
+        data: {
+          status: 'completed',
+          response_status_code: statusCode,
 
-        // DbNull مش null: تمرير null عادية لعمود Json
-        // بيرمي في Prisma.
-        response_body:
-          body === null || body === undefined
-            ? Prisma.DbNull
-            : (body as Prisma.InputJsonValue),
+          // DbNull مش null: تمرير null عادية لعمود Json
+          // بيرمي في Prisma.
+          response_body:
+            body === null || body === undefined
+              ? Prisma.DbNull
+              : (body as Prisma.InputJsonValue),
 
-        locked_until: null,
-        completed_at: new Date(),
-      },
-    });
+          locked_until: null,
+          completed_at: new Date(),
+        },
+      }),
+    );
   }
 
   /**
@@ -152,18 +241,20 @@ export class IdempotencyService {
     storeId: bigint,
     mode: ClaimRequest['mode'],
   ): Promise<void> {
-    await this.prisma.guarded().paymentIdempotencyRecord.updateMany({
-      where: {
-        id: recordId,
-        store_id: storeId,
-        mode,
-      },
-      data: {
-        status: 'failed',
-        locked_until: null,
-        completed_at: new Date(),
-      },
-    });
+    await this.prisma.withTenantTransaction(storeId, mode, (tx) =>
+      tx.paymentIdempotencyRecord.updateMany({
+        where: {
+          id: recordId,
+          store_id: storeId,
+          mode,
+        },
+        data: {
+          status: 'failed',
+          locked_until: null,
+          completed_at: new Date(),
+        },
+      }),
+    );
   }
 
   /**
@@ -178,7 +269,7 @@ export class IdempotencyService {
       'platform_sweep',
       'purge expired idempotency records',
       () =>
-        this.prisma.guarded().paymentIdempotencyRecord.deleteMany({
+        this.prisma.platform().paymentIdempotencyRecord.deleteMany({
           where: {
             expires_at: {
               lt: new Date(),
@@ -202,16 +293,16 @@ export class IdempotencyService {
     now: Date,
     lockedUntil: Date,
   ): Promise<ClaimResult> {
-    const existing = await this.prisma
-      .guarded()
-      .paymentIdempotencyRecord.findFirst({
+    const existing = await this.prisma.withTenantTransaction(request.storeId, request.mode, (tx) =>
+      tx.paymentIdempotencyRecord.findFirst({
         where: {
           store_id: request.storeId,
           mode: request.mode,
           scope: request.scope,
           idempotency_key: request.idempotencyKey,
         },
-      });
+      }),
+    );
 
     if (!existing) {
       // اتحذف بين المحاولتين (تنضيف) — المستدعي يعيد المحاولة.
@@ -303,9 +394,8 @@ export class IdempotencyService {
     request: ClaimRequest,
     lockedUntil: Date,
   ): Promise<boolean> {
-    const result = await this.prisma
-      .guarded()
-      .paymentIdempotencyRecord.updateMany({
+    const result = await this.prisma.withTenantTransaction(request.storeId, request.mode, (tx) =>
+      tx.paymentIdempotencyRecord.updateMany({
         where: {
           id: recordId,
           store_id: request.storeId,
@@ -337,7 +427,8 @@ export class IdempotencyService {
           // على سجل بقى in_flight تاني.
           response_body: Prisma.DbNull,
         },
-      });
+      }),
+    );
 
     return result.count === 1;
   }

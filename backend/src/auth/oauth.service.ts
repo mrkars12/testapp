@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service'
 import { JwtService } from '@nestjs/jwt'
 import * as crypto from 'crypto'
 import type { Response } from 'express'
+import { generateUniqueUsername } from './username.util'
 
 export interface OAuthUserDto {
   provider: string
@@ -195,9 +196,13 @@ export class OAuthService {
   }
 
   private async createOAuthUser(dto: OAuthUserDto) {
-    const username = await this.generateUniqueUsername(dto.displayName)
+    const username = await generateUniqueUsername(this.prisma, dto.displayName)
     const accounttype = dto.action === 'business' ? 'business' : 'individual'
 
+    // NOTE: `users` has no dedicated first_name/last_name columns — see
+    // FINAL_AUTH_SIGNUP_TECHNICAL_REPAIR_REPORT.md. The onboarding form's
+    // name prefill (Part 9) falls back to splitting `fullname` client-side
+    // instead of relying on stored first/last name fields.
     return this.prisma.users.create({
       data: {
         email: dto.email,
@@ -403,15 +408,5 @@ export class OAuthService {
     })
 
     return sessionId
-  }
-
-  private async generateUniqueUsername(displayName: string): Promise<string> {
-    const base = displayName.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'user'
-    let username = base
-    let counter = 1
-    while (await this.prisma.users.findUnique({ where: { username } })) {
-      username = `${base}${counter++}`
-    }
-    return username
   }
 }

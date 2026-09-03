@@ -196,30 +196,41 @@ export class LedgerService {
     beneficiaryId?: bigint | null;
     paymentAccountId?: bigint | null;
   }): Promise<bigint> {
-    const account = await this.prisma.guarded().ledgerAccount.findFirst({
-      where: {
+    return this.prisma.$transaction(async (tx) => {
+      // RLS context must be set on THIS PostgreSQL connection.
+      await tx.$executeRaw`
+        SELECT
+          set_config('app.store_id', ${params.storeId.toString()}, true),
+          set_config('app.mode', ${params.mode}, true)
+      `;
+
+      const where: Prisma.LedgerAccountWhereInput = {
         store_id: params.storeId,
         mode: params.mode,
         currency: params.currency,
         account_type: params.accountType,
-        beneficiary_id: params.beneficiaryId ?? null,
-        payment_account_id: params.paymentAccountId ?? null,
-      },
-      select: {
-        id: true,
-      },
-    });
+      };
 
-    if (!account) {
-      return 0n;
-    }
+      if (params.beneficiaryId !== undefined) {
+        where.beneficiary_id = params.beneficiaryId;
+      }
 
-    /**
-     * This raw query is still tenant-safe because it is constrained by
-     * the ledger_account_id that was resolved above using store_id + mode.
-     * There is no user-supplied cross-store identifier entering this query.
-     */
-    const rows = await this.prisma.$queryRaw<DirectionTotalRow[]>`
+      if (params.paymentAccountId !== undefined) {
+        where.payment_account_id = params.paymentAccountId;
+      }
+
+      const account = await tx.ledgerAccount.findFirst({
+        where,
+        select: {
+          id: true,
+        },
+      });
+
+      if (!account) {
+        return 0n;
+      }
+
+      const rows = await tx.$queryRaw<DirectionTotalRow[]>`
         SELECT
           direction,
           SUM(amount_minor) AS total
@@ -228,15 +239,15 @@ export class LedgerService {
         GROUP BY direction
       `;
 
-    let balance = 0n;
+      let balance = 0n;
 
-    for (const row of rows) {
-      const total = row.total === null ? 0n : BigInt(row.total);
+      for (const row of rows) {
+        const total = row.total === null ? 0n : BigInt(row.total);
+        balance += row.direction === 'debit' ? total : -total;
+      }
 
-      balance += row.direction === 'debit' ? total : -total;
-    }
-
-    return balance;
+      return balance;
+    });
   }
 
   /**

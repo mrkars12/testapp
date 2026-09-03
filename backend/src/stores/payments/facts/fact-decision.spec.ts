@@ -13,14 +13,35 @@ const input = (over: Partial<DecisionInput> = {}): DecisionInput => ({
 })
 
 describe('audit-only facts', () => {
-  it('records disputes without acting on them', () => {
-    for (const factType of ['dispute_opened', 'dispute_updated', 'dispute_closed'] as const) {
+  it('records dispute status changes that carry no outcome', () => {
+    // A dispute moving to "under review", or closing with no winner,
+    // changes nothing financially. Only opened/won/lost move money.
+    for (const factType of ['dispute_updated', 'dispute_closed'] as const) {
       expect(decideFact(input({ factType })).kind).toBe('record_only')
     }
   })
 
   it('records settlement lines', () => {
+    // Settlement is not implemented: there is no rule for reconciling
+    // provider fees against estimates and no provider integration to
+    // supply a payout, so acting on this would be guesswork.
     expect(decideFact(input({ factType: 'settlement_line' })).kind).toBe('record_only')
+  })
+
+  it('no longer discards disputes', () => {
+    // Until this milestone these were record_only, so a chargeback never
+    // reached the ledger and the receivable stayed overstated.
+    for (const factType of ['dispute_opened', 'dispute_won', 'dispute_lost'] as const) {
+      expect(decideFact(input({ factType })).kind).toBe('apply_dispute')
+    }
+  })
+
+  it('refuses a dispute with no amount', () => {
+    expect(
+      decideFact(
+        input({ factType: 'dispute_opened', cumulativeAmountMinor: undefined }),
+      ),
+    ).toEqual({ kind: 'ignore', reason: 'amount_missing' })
   })
 
   it('no longer discards refunds', () => {
@@ -141,7 +162,30 @@ describe('other attempt facts', () => {
 })
 
 describe('ordering guards', () => {
-  it('ignores anything arriving after a terminal state', () => {
+  it('ignores a non-funded outcome arriving after a terminal state', () => {
+    // failed -> cancelled. Neither carries money, so there is nothing to
+    // prefer the newer one for; a re-report of the SAME status is a
+    // same-state no-op and stays legal.
+    const decision = decideFact(
+      input({
+        snapshot: { status: 'failed', capturedTotalMinor: 0n, refundedTotalMinor: 0n },
+        factType: 'attempt_voided',
+        cumulativeAmountMinor: undefined,
+      }),
+    )
+    expect(decision).toEqual({ kind: 'ignore', reason: 'terminal_state' })
+  })
+
+  /*
+   * The retry regression. A declined attempt must not poison the intent
+   * against a later, genuine payment for the same order.
+   *
+   * Reproduced against the real Moyasar test account: the payer's card
+   * was declined, they paid again on the same invoice, and the capture
+   * was recorded `applied = false, superseded_reason = terminal_state` —
+   * Moyasar had the money and this system had no order.
+   */
+  it('applies an authorization that arrives after a failed attempt', () => {
     const decision = decideFact(
       input({
         snapshot: { status: 'failed', capturedTotalMinor: 0n, refundedTotalMinor: 0n },
@@ -149,7 +193,87 @@ describe('ordering guards', () => {
         cumulativeAmountMinor: undefined,
       }),
     )
-    expect(decision).toEqual({ kind: 'ignore', reason: 'terminal_state' })
+    expect(decision.kind).toBe('apply')
+  })
+
+  it('applies a capture that arrives after a failed attempt', () => {
+    const decision = decideFact(
+      input({
+        snapshot: { status: 'failed', capturedTotalMinor: 0n, refundedTotalMinor: 0n },
+        factType: 'attempt_captured',
+        cumulativeAmountMinor: 10_000n,
+      }),
+    )
+    expect(decision).toMatchObject({
+      kind: 'apply',
+      intentStatus: 'captured',
+      attemptStatus: 'succeeded',
+      capturedTotalMinor: 10_000n,
+    })
+  })
+
+  it('applies a capture that arrives after an expired intent', () => {
+    expect(
+      decideFact(
+        input({
+          snapshot: { status: 'expired', capturedTotalMinor: 0n, refundedTotalMinor: 0n },
+          factType: 'attempt_captured',
+          cumulativeAmountMinor: 10_000n,
+        }),
+      ).kind,
+    ).toBe('apply')
+  })
+
+  /*
+   * The other direction must stay shut: recovery is one-way. A late
+   * failure for an older attempt cannot unpay an order that was paid.
+   */
+  it('still refuses a failure arriving after a capture', () => {
+    expect(
+      decideFact(
+        input({
+          snapshot: { status: 'captured', capturedTotalMinor: 10_000n, refundedTotalMinor: 0n },
+          factType: 'attempt_failed',
+          cumulativeAmountMinor: undefined,
+        }),
+      ),
+    ).toEqual({ kind: 'ignore', reason: 'terminal_state' })
+  })
+
+  it('still refuses a void arriving after a capture', () => {
+    expect(
+      decideFact(
+        input({
+          snapshot: { status: 'captured', capturedTotalMinor: 10_000n, refundedTotalMinor: 0n },
+          factType: 'attempt_voided',
+          cumulativeAmountMinor: undefined,
+        }),
+      ),
+    ).toEqual({ kind: 'ignore', reason: 'terminal_state' })
+  })
+
+  it('still refuses an expiry arriving after a capture', () => {
+    expect(
+      decideFact(
+        input({
+          snapshot: { status: 'captured', capturedTotalMinor: 10_000n, refundedTotalMinor: 0n },
+          factType: 'attempt_expired',
+          cumulativeAmountMinor: undefined,
+        }),
+      ),
+    ).toEqual({ kind: 'ignore', reason: 'terminal_state' })
+  })
+
+  it('reports a redelivered capture on a recovered intent as already applied', () => {
+    expect(
+      decideFact(
+        input({
+          snapshot: { status: 'captured', capturedTotalMinor: 10_000n, refundedTotalMinor: 0n },
+          factType: 'attempt_captured',
+          cumulativeAmountMinor: 10_000n,
+        }),
+      ),
+    ).toEqual({ kind: 'ignore', reason: 'already_applied' })
   })
 
   it('ignores an illegal backwards transition', () => {
@@ -174,14 +298,17 @@ describe('ordering guards', () => {
     ).toBe('apply')
   })
 
-  it('ignores a capture arriving after the intent was cancelled', () => {
+  it('applies a capture arriving after the intent was cancelled', () => {
+    // Cancellation is not funded, so money arriving afterwards is the
+    // stronger fact. The payer cancelled at the gateway, came back, and
+    // paid — the order is theirs.
     expect(
       decideFact(
         input({
           snapshot: { status: 'cancelled', capturedTotalMinor: 0n, refundedTotalMinor: 0n },
         }),
-      ),
-    ).toEqual({ kind: 'ignore', reason: 'terminal_state' })
+      ).kind,
+    ).toBe('apply')
   })
 })
 
@@ -294,5 +421,45 @@ describe('refunds', () => {
         cumulativeAmountMinor: 4000n,
       }).kind,
     ).toBe('ignore')
+  })
+})
+
+describe('currency verification — what the gateway settled vs what we priced', () => {
+  const priced = (over: Partial<DecisionInput> = {}): DecisionInput =>
+    input({ currency: 'SAR', ...over })
+
+  it('applies a capture in the currency the order was priced in', () => {
+    expect(priced({ factCurrency: 'SAR' }).currency).toBe('SAR')
+    expect(decideFact(priced({ factCurrency: 'SAR' })).kind).toBe('apply')
+  })
+
+  it('refuses a capture the provider settled in another currency', () => {
+    // 100 of something else is not 100 of what the customer agreed to
+    // pay. The fact is still recorded by the applier; it just may not
+    // move money or the order.
+    expect(decideFact(priced({ factCurrency: 'USD' }))).toEqual({
+      kind: 'ignore',
+      reason: 'currency_mismatch',
+    })
+  })
+
+  it('ignores case and padding rather than failing a real payment on them', () => {
+    expect(decideFact(priced({ factCurrency: ' sar ' })).kind).toBe('apply')
+  })
+
+  it('refuses a refund, an authorization and a dispute in the wrong currency too', () => {
+    for (const factType of ['refund_succeeded', 'attempt_authorized', 'dispute_opened'] as const) {
+      expect(
+        decideFact(priced({ factType, factCurrency: 'USD', cumulativeAmountMinor: 5000n })),
+      ).toEqual({ kind: 'ignore', reason: 'currency_mismatch' })
+    }
+  })
+
+  it('treats a currency the provider did not report as unreported, not as different', () => {
+    // ObservedFact.currency is optional on the contract and several
+    // adapters legitimately omit it. Refusing those would break every
+    // payment they make.
+    expect(decideFact(priced({ factCurrency: undefined })).kind).toBe('apply')
+    expect(decideFact(input({ currency: undefined, factCurrency: 'USD' })).kind).toBe('apply')
   })
 })

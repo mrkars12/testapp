@@ -2,6 +2,18 @@
 
 import { useRouter, usePathname } from 'next/navigation'
 
+/**
+ * Auth-history policy: moving between the auth ENTRY pages (`/login` ⇄
+ * `/register` ⇄ `/forgot-password`) is lateral navigation between
+ * interchangeable temporary auth steps — not a forward journey the user
+ * should be able to Back through. Every later auth step
+ * (`register` → account-info → verify-email → store, `login` → store,
+ * chooser → store) navigates with `router.replace`, so a single `push`
+ * here would be the one history entry that survives the whole flow and
+ * lets browser Back re-open a completed auth page from an authenticated
+ * page. So these cross-links `replace` too; each auth page still exposes
+ * its own explicit link back to the others.
+ */
 export default function AuthNavigationLinks() {
   const router = useRouter()
   const pathname = usePathname()
@@ -23,7 +35,7 @@ export default function AuthNavigationLinks() {
               ليس لديك حساب؟{' '}
               <button
                 type="button"
-                onClick={() => router.push('/register')}
+                onClick={() => router.replace('/register')}
                 className="text-cyan-600 dark:text-cyan-400 font-bold hover:underline transition-colors"
               >
                 أنشئ حسابك الآن
@@ -36,7 +48,7 @@ export default function AuthNavigationLinks() {
             {/* رابط نسيت كلمة المرور حصرياً هنا */}
             <button
               type="button"
-              onClick={() => router.push('/forgot-password')}
+              onClick={() => router.replace('/forgot-password')}
               className="text-emerald-600 dark:text-emerald-400 hover:underline transition-colors"
             >
               نسيت كلمة المرور؟
@@ -50,7 +62,7 @@ export default function AuthNavigationLinks() {
             لديك حساب بالفعل؟{' '}
             <button
               type="button"
-              onClick={() => router.push('/login')}
+              onClick={() => router.replace('/login')}
               className="text-emerald-600 dark:text-emerald-400 font-bold hover:underline transition-colors"
             >
               سجل الدخول الآن
@@ -64,7 +76,7 @@ export default function AuthNavigationLinks() {
             لديك حساب بالفعل؟{' '}
             <button
               type="button"
-              onClick={() => router.push('/login')}
+              onClick={() => router.replace('/login')}
               className="text-emerald-600 dark:text-emerald-400 font-bold hover:underline transition-colors"
             >
               سجل الدخول الآن

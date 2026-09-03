@@ -12,6 +12,12 @@ export interface StripeClientLike {
     capture(id: string, params?: Record<string, unknown>, options?: Record<string, unknown>): Promise<any>
     cancel(id: string, params?: Record<string, unknown>, options?: Record<string, unknown>): Promise<any>
   }
+  checkout: {
+    sessions: {
+      create(params: Record<string, unknown>, options?: Record<string, unknown>): Promise<any>
+      retrieve(id: string, params?: Record<string, unknown>): Promise<any>
+    }
+  }
   refunds: {
     create(params: Record<string, unknown>, options?: Record<string, unknown>): Promise<any>
   }

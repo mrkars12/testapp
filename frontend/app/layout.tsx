@@ -23,7 +23,17 @@ type RootLayoutProps = {
 export default function RootLayout({ children }: RootLayoutProps) {
   return (
     <html
-      lang="en"
+      // The visible UI text throughout this app (payment settings, stores,
+      // products, etc.) is predominantly Arabic while this was declared
+      // "en" — that mismatch is exactly what triggers Chrome's built-in
+      // "Translate this page?" prompt, which then injects the
+      // gstatic.com/_/translate_http/... stylesheet our CSP (correctly)
+      // blocks. There is no Google Translate integration anywhere in this
+      // app's own code (confirmed by search) — this is the browser
+      // reacting to the wrong declared language, not a resource we load.
+      // Fixing the actual `lang` mismatch removes the trigger; loosening
+      // the CSP to permit an uninvited browser feature would not.
+      lang="ar"
       suppressHydrationWarning
     >
 

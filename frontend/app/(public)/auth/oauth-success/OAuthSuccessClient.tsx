@@ -6,14 +6,19 @@ import { useEffect } from 'react'
 import { useAuthState } from '@/lib/authState'
 import { useQueryClient } from '@tanstack/react-query'
 import api from '@/lib/api'
+import { authedHome } from '@/lib/storeBootstrap'
+import { AUTH_TAB_ID } from '@/lib/auth-tab-id'
 
 export default function OAuthSuccessClient() {
   const params = useSearchParams()
   const router = useRouter()
   const queryClient = useQueryClient()
-  
+
   const sessionId = params.get('session_id')
-  const intendedPath = params.get('intended') || '/dashboard'
+  // No `intended` param means the backend had no explicit deep-link target
+  // (see OAuthController.buildState) — resolved below via store count
+  // instead of defaulting to the account dashboard (Part 12).
+  const explicitIntended = params.get('intended')
 
   // 🍏 1. لقط بارامترات فحص الجهاز الجديد المشفرة القادمة من الباك إند
   const isDeviceCheck = params.get('device_check')
@@ -67,6 +72,11 @@ export default function OAuthSuccessClient() {
         // 5. تطهير شامل لمنع تعليق زر الـ Back Button
         await queryClient.invalidateQueries({ queryKey: ['auth-user'] })
 
+        // Single post-auth destination owner — validates `intended`
+        // (safe + not an auth route + owned store) then fresh-login
+        // resolution (chooser allowed in this context).
+        const targetPath = await authedHome('fresh-login', explicitIntended)
+
         /**
          * 📡 6. [مزامنة التابات المفتوحة]: إرسال الـ intendedPath الحقيقي للتابات الأخرى
          */
@@ -74,18 +84,19 @@ export default function OAuthSuccessClient() {
           const bc = new BroadcastChannel('auth_sync_channel')
           bc.postMessage({
             type: 'AUTH_LOGIN_SYNC',
+            senderId: AUTH_TAB_ID,
             userPayload: {
               authenticated: true,
               user: res.data.user,
               session_id: sessionId,
             },
-            intendedPath: intendedPath,
+            intendedPath: targetPath,
           })
           bc.close()
         } catch {}
 
         // 7. طيران فوري على الصفحة اللي كان عايزها المستخدم بنعومة وبدون ريفريش
-        router.replace(intendedPath)
+        router.replace(targetPath)
       } catch (err) {
         // تصفير وتنظيف في حالة الفشل وتوجيه للوجين
         useAuthState.getState().setStatus('unauthenticated')
@@ -94,7 +105,7 @@ export default function OAuthSuccessClient() {
         router.replace('/login?error=oauth_failed')
       }
     })()
-  }, [sessionId, isDeviceCheck, payload, emailParam, intendedPath, router, queryClient])
+  }, [sessionId, isDeviceCheck, payload, emailParam, explicitIntended, router, queryClient])
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-white dark:bg-gray-950">

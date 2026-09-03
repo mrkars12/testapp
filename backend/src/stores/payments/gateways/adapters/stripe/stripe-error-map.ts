@@ -42,6 +42,7 @@ const ERROR_CODE: Readonly<Record<string, PaymentErrorCode>> = {
   incorrect_cvc: 'declined_card_invalid',
   processing_error: 'provider_unavailable',
   authentication_required: 'authentication_required',
+  authentication_failure: 'authentication_failed',
   payment_intent_authentication_failure: 'authentication_failed',
   amount_too_large: 'amount_limit',
   amount_too_small: 'amount_limit',
@@ -51,6 +52,19 @@ const ERROR_CODE: Readonly<Record<string, PaymentErrorCode>> = {
   api_key_expired: 'configuration_error',
   testmode_charges_only: 'mode_mismatch',
   livemode_mismatch: 'mode_mismatch',
+  // These are Stripe's own `error-codes` reference entries for a
+  // declined non-card confirmation (redirect/QR/wallet payment
+  // methods — e.g. the TEST "Simulate scan" flow's Authorize/Fail
+  // page). Cards report through `decline_code`; these payment
+  // methods report through `code` instead, and previously matched
+  // nothing here, which is what made a rejected TEST "Simulate scan"
+  // surface as "سبب الفشل: unknown" with no more specific reason —
+  // even though Stripe itself was already telling us "the customer
+  // didn't approve the payment".
+  payment_method_customer_decline: 'declined_do_not_honor',
+  payment_method_provider_decline: 'declined_do_not_honor',
+  payment_method_not_available: 'method_unavailable',
+  payment_method_provider_timeout: 'provider_timeout',
 }
 
 const ERROR_TYPE: Readonly<Record<string, PaymentErrorCode>> = {

@@ -252,37 +252,13 @@ try {
 }
 
 /**
-
-* ✅ block back button
-  */
-  useEffect(() => {
-
-window.history.pushState(
-
-  null,
-  '',
-  window.location.href
-)
-
-const handleBack = () => {
-
-  window.history.go(1)
-}
-
-window.addEventListener(
-  'popstate',
-  handleBack
-)
-
-return () => {
-
-  window.removeEventListener(
-    'popstate',
-    handleBack
-  )
-}
-
-}, [])
+ * Auth-history policy: no popstate/pushState Back-button trap. This step
+ * is reached from an emailed link and, on a successful reset, does
+ * `router.replace('/login')` (and `router.replace('/forgot-password')` for
+ * an expired link), so it never stays in history as a page Back can
+ * re-open. Intercepting `popstate` to force the user forward is exactly
+ * the kind of navigation hack the policy forbids.
+ */
 
 /**
 

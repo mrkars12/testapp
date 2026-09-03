@@ -29,6 +29,18 @@ export type IgnoreReason =
   | 'already_applied'
   /** Provider reported a refund larger than the capture it belongs to. */
   | 'refund_exceeds_capture'
+  /**
+   * The provider settled in a different currency than the order was
+   * priced in.
+   *
+   * Never applied, in either direction: marking an order paid because
+   * 100 of *something* arrived, when it was priced at 100 of something
+   * else, is a real loss the customer never agreed to. The fact is still
+   * recorded (applied = false), so the merchant and reconciliation see
+   * that a payment exists and can act on it — it is simply not allowed
+   * to move money or the order's state on its own.
+   */
+  | 'currency_mismatch'
 
 export type RefundDecision =
   | { readonly kind: 'ignore'; readonly reason: IgnoreReason }
@@ -41,8 +53,17 @@ export type RefundDecision =
       readonly succeeded: boolean
     }
 
+export type DisputeDecision =
+  | { readonly kind: 'ignore'; readonly reason: IgnoreReason }
+  | {
+      readonly kind: 'apply_dispute'
+      readonly disputeStatus: 'open' | 'won' | 'lost'
+      readonly amountMinor: bigint
+    }
+
 export type FactDecision =
   | RefundDecision
+  | DisputeDecision
   /** Stale or illegal. Record the event with applied=false, change nothing. */
   | { readonly kind: 'ignore'; readonly reason: IgnoreReason }
   /** Audit only: nothing in this phase can act on it. */
@@ -62,6 +83,18 @@ export interface DecisionInput {
   readonly snapshot: IntentSnapshot
   /** The intent's full amount, used to tell partial from full capture. */
   readonly amountMinor: bigint
+  /**
+   * The currency the order was priced in (ISO-4217, as stored).
+   *
+   * Together with `factCurrency` this is the currency half of the
+   * "verify what the gateway actually did against what we asked for"
+   * check. Optional so a caller that genuinely has neither value — a
+   * unit test of ordering, an internal fact with no money on it — is
+   * unaffected: the check runs only when both sides are known.
+   */
+  readonly currency?: string
+  /** The currency the provider reported on this fact, if it reported one. */
+  readonly factCurrency?: string
   readonly factType: ObservedFactType
   /** Cumulative as the provider sees it, not a delta. */
   readonly cumulativeAmountMinor?: bigint
@@ -69,13 +102,29 @@ export interface DecisionInput {
   readonly occurredAt?: Date
 }
 
-/** Facts that only ever produce an audit record in this phase. */
+/**
+ * Facts that only ever produce an audit record.
+ *
+ * `dispute_updated` and `dispute_closed` are status changes with no
+ * outcome, so there is nothing to post. `settlement_line` stays here
+ * because settlement is not implemented — see the stage report; acting
+ * on it would require fee and matching rules this codebase does not
+ * define.
+ */
 const AUDIT_ONLY: ReadonlySet<ObservedFactType> = new Set<ObservedFactType>([
-  'dispute_opened',
   'dispute_updated',
   'dispute_closed',
   'settlement_line',
 ])
+
+/** Dispute facts that move the ledger, and the state they put the dispute in. */
+const DISPUTE_OUTCOME: Readonly<
+  Partial<Record<ObservedFactType, 'open' | 'won' | 'lost'>>
+> = {
+  dispute_opened: 'open',
+  dispute_won: 'won',
+  dispute_lost: 'lost',
+}
 
 const ATTEMPT_STATUS: Readonly<
   Partial<Record<ObservedFactType, PaymentAttemptStatus>>
@@ -97,6 +146,13 @@ const TERMINAL_FACTS: ReadonlySet<ObservedFactType> = new Set<ObservedFactType>(
 export function decideFact(input: DecisionInput): FactDecision {
   const { factType } = input
 
+  // Checked before anything else money-related, and for every fact type:
+  // a refund, a dispute and a capture in the wrong currency are all
+  // equally not ours to act on.
+  if (isCurrencyMismatch(input)) {
+    return { kind: 'ignore', reason: 'currency_mismatch' }
+  }
+
   if (AUDIT_ONLY.has(factType)) {
     return {
       kind: 'record_only',
@@ -108,6 +164,25 @@ export function decideFact(input: DecisionInput): FactDecision {
   // It moves the intent's refunded total, which the caller applies.
   if (factType === 'refund_succeeded' || factType === 'refund_failed') {
     return decideRefund(input)
+  }
+
+  // A dispute moves neither the attempt nor the intent's totals: the
+  // payment did happen, and the money is held or written off beside it.
+  // The dispute's own row carries the state.
+  const disputeStatus = DISPUTE_OUTCOME[factType]
+
+  if (disputeStatus) {
+    if (input.cumulativeAmountMinor === undefined) {
+      // Holding or writing off an unknown amount is not something to
+      // guess at: the ledger would take a number nobody reported.
+      return { kind: 'ignore', reason: 'amount_missing' }
+    }
+
+    return {
+      kind: 'apply_dispute',
+      disputeStatus,
+      amountMinor: input.cumulativeAmountMinor,
+    }
   }
 
   const attemptStatus = ATTEMPT_STATUS[factType]
@@ -221,6 +296,23 @@ function decideRefund(input: DecisionInput): RefundDecision {
     newRefundMinor,
     succeeded: true,
   }
+}
+
+/**
+ * Whether the provider reported a currency the order was not priced in.
+ *
+ * Compared case-insensitively and only when both sides are present:
+ * `ObservedFact.currency` is optional on the contract and several
+ * adapters legitimately omit it, and an absent value is "not reported",
+ * never "reported as different".
+ */
+function isCurrencyMismatch(input: DecisionInput): boolean {
+  const expected = input.currency?.trim().toUpperCase()
+  const reported = input.factCurrency?.trim().toUpperCase()
+
+  if (!expected || !reported) return false
+
+  return expected !== reported
 }
 
 function candidateIntentStatus(

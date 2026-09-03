@@ -22,6 +22,26 @@ import { store as StoreRecord } from '@prisma/client'
 export class ActiveStoreService {
   constructor(private readonly prisma: PrismaService) {}
 
+  /** أكبر قيمة يقدر عمود bigint في Postgres يشيلها. */
+  private static readonly MAX_STORE_ID = 9223372036854775807n
+
+  /**
+   * يحوّل الـ identifier لـ id رقمي، أو null لو مش رقم أصلاً أو رقم
+   * أكبر من اللي العمود يستحمله.
+   *
+   * ⚠️ الجزء بتاع الحد الأقصى مش تجميل: من غيره الرقم الكبير كان
+   * بيتبعت لـ Postgres وبيرجع خطأ من الـ driver، اللي بيطلع للعميل
+   * 500 بدل 404. أي هيدر X-Store-Id قديم أو متعدّل بالإيد لازم يبقى
+   * رفض نضيف الواجهة تقدر تتعافى منه، مش صفحة خطأ.
+   */
+  private toStoreId(storeIdentifier: string): bigint | null {
+    if (!/^\d+$/.test(storeIdentifier)) return null
+
+    const value = BigInt(storeIdentifier)
+
+    return value > ActiveStoreService.MAX_STORE_ID ? null : value
+  }
+
   /**
    * يحل المتجر الفعّال. لا يفرّق بين "غير موجود" و"غير مملوك" في الخطأ
    * المرجوع — مناسب للاستخدام العام (قراءة/كتابة) في الـ Guard.
@@ -33,13 +53,13 @@ export class ActiveStoreService {
     const ownerId = BigInt(userId)
 
     if (storeIdentifier) {
-      const isNumericId = /^\d+$/.test(storeIdentifier)
+      const numericId = this.toStoreId(storeIdentifier)
 
       const store = await this.prisma.store.findFirst({
         where: {
           ownerId,
-          ...(isNumericId
-            ? { id: BigInt(storeIdentifier) }
+          ...(numericId !== null
+            ? { id: numericId }
             : { slug: storeIdentifier }),
         },
       })
@@ -78,11 +98,11 @@ export class ActiveStoreService {
     storeIdentifier: string,
   ): Promise<StoreRecord> {
     const ownerId = BigInt(userId)
-    const isNumericId = /^\d+$/.test(storeIdentifier)
+    const numericId = this.toStoreId(storeIdentifier)
 
     const store = await this.prisma.store.findFirst({
-      where: isNumericId
-        ? { id: BigInt(storeIdentifier) }
+      where: numericId !== null
+        ? { id: numericId }
         : { slug: storeIdentifier },
     })
 

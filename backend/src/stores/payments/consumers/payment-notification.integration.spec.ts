@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient, Prisma } from '@prisma/client'
 import { ConfigService } from '@nestjs/config'
 import { SchedulerRegistry } from '@nestjs/schedule'
 import { OutboxService } from '../../../common/messaging/outbox.service'
@@ -128,13 +128,37 @@ describe('payment notifications over the outbox (integration)', () => {
     )
   })
 
+  /**
+   * `outbox_messages` and `consumed_events` are RLS-enabled
+   * (test/global-setup.ts): the raw `rls_test` client this spec holds can
+   * only read or write them once `app.store_id`/`app.mode` are installed
+   * on the same transaction — exactly what `OutboxDispatcherService` and
+   * `ConsumedEventService` themselves now do via `withTenantTransaction`.
+   * `store` and `notifications` (what `PaymentNotificationConsumer`
+   * itself reads/writes) carry no RLS policy at all — see the
+   * implementation report for why — so calls against those two tables
+   * are deliberately left as plain `prisma.*` calls below, not wrapped.
+   */
+  async function withTenant<T>(
+    cb: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    return prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        SELECT
+          set_config('app.store_id', ${storeId.toString()}, true),
+          set_config('app.mode', 'live', true)
+      `
+      return cb(tx as Prisma.TransactionClient)
+    })
+  }
+
   /** Emits an event the way production does: inside a transaction. */
   async function emit(
     eventType: string,
     payload: Record<string, unknown> = {},
   ): Promise<bigint> {
-    return prisma.$transaction((tx) =>
-      outbox.emit(tx as never, {
+    return withTenant((tx) =>
+      outbox.emit(tx, {
         storeId,
         mode: 'live',
         aggregateType: 'order',
@@ -178,9 +202,11 @@ describe('payment notifications over the outbox (integration)', () => {
       const id = await emit('checkout.committed')
       await dispatcher.dispatchBatch()
 
-      const message = await prisma.outboxMessage.findFirstOrThrow({
-        where: { id },
-      })
+      const message = await withTenant((tx) =>
+        tx.outboxMessage.findFirstOrThrow({
+          where: { id },
+        }),
+      )
       expect(message.status).toBe('published')
     })
 
@@ -208,6 +234,36 @@ describe('payment notifications over the outbox (integration)', () => {
       ])
     })
 
+    /*
+     * ROUND 9 — the oversell exception has to REACH the merchant.
+     *
+     * `CheckoutFinalizerService` emits `inventory.oversold` when a paid
+     * order could not take its stock. Emitting it is only half the
+     * requirement: without a consumer it is a row nobody reads. It goes
+     * through this consumer, the one the project already uses for
+     * "something happened the merchant must act on", rather than a new
+     * channel of its own.
+     */
+    it('turns an oversell into an actionable notification for the owner', async () => {
+      await emit('inventory.oversold', {
+        checkoutId: '7',
+        lines: [{ variantId: '3', quantity: 2 }],
+      })
+
+      expect(await dispatcher.dispatchBatch()).toBe(1)
+
+      const notification = await prisma.notifications.findFirstOrThrow({})
+      expect(notification.user_id).toBe(ownerId)
+      expect(notification.type).toBe('inventory.oversold')
+      // The count is the actionable part: "an order oversold" with no
+      // number tells the merchant nothing they can do.
+      expect(notification.message).toContain('2')
+      expect(notification.message).toContain('1001')
+      expect(realtime.pushed).toEqual([
+        { userId: ownerId.toString(), event: 'payment_event' },
+      ])
+    })
+
     it('carries no customer details into the notification', async () => {
       await emit('checkout.committed')
       await dispatcher.dispatchBatch()
@@ -226,7 +282,9 @@ describe('payment notifications over the outbox (integration)', () => {
       // First pass fails inside the handler.
       await dispatcher.dispatchBatch()
 
-      let message = await prisma.outboxMessage.findFirstOrThrow({ where: { id } })
+      let message = await withTenant((tx) =>
+        tx.outboxMessage.findFirstOrThrow({ where: { id } }),
+      )
       expect(message.status).toBe('pending')
       expect(message.attempts).toBe(1)
       expect(message.last_error).toContain('exploded')
@@ -237,7 +295,9 @@ describe('payment notifications over the outbox (integration)', () => {
       // that the retry skips the handler and marks it published.
       await dispatcher.dispatchBatch()
 
-      message = await prisma.outboxMessage.findFirstOrThrow({ where: { id } })
+      message = await withTenant((tx) =>
+        tx.outboxMessage.findFirstOrThrow({ where: { id } }),
+      )
       expect(message.status).toBe('published')
       expect(await prisma.notifications.count()).toBe(1)
     })
@@ -260,7 +320,9 @@ describe('payment notifications over the outbox (integration)', () => {
       await dispatcher.dispatchBatch()
       await dispatcher.dispatchBatch()
 
-      const message = await prisma.outboxMessage.findFirstOrThrow({ where: { id } })
+      const message = await withTenant((tx) =>
+        tx.outboxMessage.findFirstOrThrow({ where: { id } }),
+      )
       expect(message.status).toBe('dead')
       expect(await prisma.notifications.count()).toBe(0)
       expect(await dispatcher.deadLetterCount()).toBe(1)
@@ -274,7 +336,9 @@ describe('payment notifications over the outbox (integration)', () => {
 
       await dispatcher.dispatchBatch()
 
-      const message = await prisma.outboxMessage.findFirstOrThrow({ where: { id } })
+      const message = await withTenant((tx) =>
+        tx.outboxMessage.findFirstOrThrow({ where: { id } }),
+      )
       expect(message.status).toBe('published')
       expect(await prisma.notifications.count()).toBe(1)
     })
@@ -295,7 +359,9 @@ describe('payment notifications over the outbox (integration)', () => {
       await emit('checkout.committed')
       await dispatcher.dispatchBatch()
 
-      const consumedRows = await prisma.consumedEvent.findMany({})
+      const consumedRows = await withTenant((tx) =>
+        tx.consumedEvent.findMany({}),
+      )
       expect(consumedRows).toHaveLength(1)
       expect(consumedRows[0].consumer_name).toBe('payments.notifications')
     })
@@ -342,7 +408,9 @@ describe('payment notifications over the outbox (integration)', () => {
       const id = await emit('checkout.committed')
       await dispatcher.dispatchBatch()
 
-      const message = await prisma.outboxMessage.findFirstOrThrow({ where: { id } })
+      const message = await withTenant((tx) =>
+        tx.outboxMessage.findFirstOrThrow({ where: { id } }),
+      )
 
       const consumer = new PaymentNotificationConsumer(
         prisma as never,
@@ -375,7 +443,9 @@ describe('payment notifications over the outbox (integration)', () => {
 
       await dispatcher.dispatchBatch()
 
-      const message = await prisma.outboxMessage.findFirstOrThrow({ where: { id } })
+      const message = await withTenant((tx) =>
+        tx.outboxMessage.findFirstOrThrow({ where: { id } }),
+      )
       expect(message.status).toBe('published')
       expect(await prisma.notifications.count()).toBe(0)
     })

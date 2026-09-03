@@ -48,57 +48,6 @@ export class UploadsService {
 
   constructor(private prisma: PrismaService) {}
 
-  /**
-   * FIX (root cause of every upload failing with 500 "Cannot convert
-   * undefined to a BigInt"): the controller used to read `req.user.storeId`,
-   * which does not exist on the session user object — only `req.user.id`
-   * does (see ProductController / ProductService.getStore, which resolve
-   * the store via `ownerId: BigInt(userId)`). We resolve the store the same
-   * way here so uploads always target the right store instead of crashing
-   * before ever reaching R2.
-   */
-  private async resolveStoreId(
-    userId: string | number | bigint,
-  ): Promise<bigint> {
-    const store = await this.prisma.store.findFirst({
-      where: { ownerId: BigInt(userId) },
-    });
-
-    if (!store) {
-      throw new UnauthorizedException('لا يوجد متجر مرتبط بهذا الحساب');
-    }
-
-    return store.id;
-  }
-
-  async presignForUser(
-    userId: string | number | bigint,
-    body: {
-      fileName: string;
-      mimeType: string;
-      size: number;
-      folder: 'products' | 'variants';
-    },
-  ) {
-    const storeId = await this.resolveStoreId(userId);
-    return this.presign(storeId, body);
-  }
-
-  async confirmForUser(
-    userId: string | number | bigint,
-    key: string,
-    attachedType?: string,
-    attachedId?: string,
-  ) {
-    const storeId = await this.resolveStoreId(userId);
-    return this.confirm(storeId, key, attachedType, attachedId);
-  }
-
-  async removeForUser(userId: string | number | bigint, key: string) {
-    const storeId = await this.resolveStoreId(userId);
-    return this.remove(storeId, key);
-  }
-
   async presign(
     storeId: bigint,
     body: {

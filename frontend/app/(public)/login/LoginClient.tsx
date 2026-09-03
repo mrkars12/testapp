@@ -12,6 +12,8 @@ import Turnstile from 'react-turnstile'
 import SocialAuthButtons from '@/components/SocialAuthButtons'
 import toast from 'react-hot-toast'
 import AuthNavigationLinks from '@/components/AuthNavigationLinks'
+import { authedHome } from '@/lib/storeBootstrap'
+import { AUTH_TAB_ID } from '@/lib/auth-tab-id'
 
 export default function LoginClient({ intended }: { intended?: string }) {
   const router = useRouter()
@@ -121,15 +123,30 @@ const [oauthTempToken, setOauthTempToken] = useState<string | null>(null)
       useAuthState.getState().setSession(data.session_id)
     }
 
-    queryClient.setQueryData(['auth-user'], {
-      authenticated: true,
-      user: data.user,
-      session_id: data.session_id
+    // Merge onto whatever `AuthProvider.login()` already put here (it does
+    // its own `GET /auth/me` first, which is authoritative). NEVER let a
+    // known `email_verified_at` regress to null/undefined just because this
+    // login payload is thinner — a verified account flashing as unverified
+    // is exactly what bounces it to `/verify-email` right after login.
+    queryClient.setQueryData(['auth-user'], (prev: { user?: Record<string, unknown> | null; session_id?: string | null } | undefined) => {
+      const prevUser = prev?.user ?? null
+      const nextUser: Record<string, unknown> = { ...(prevUser ?? {}), ...(data.user ?? {}) }
+      if (nextUser.email_verified_at == null && prevUser?.email_verified_at != null) {
+        nextUser.email_verified_at = prevUser.email_verified_at
+      }
+      return {
+        authenticated: true,
+        user: nextUser,
+        session_id: data.session_id ?? prev?.session_id ?? null,
+      }
     })
 
-    const urlIntended = searchParams.get('intended') || searchParams.get('redirect')
-    const rawTarget = intended || urlIntended || '/dashboard'
-    const targetPath = decodeURIComponent(rawTarget)
+    // Single post-auth destination owner. It validates `intended` (safe,
+    // non-auth-route, and — for a /store/<slug> link — owned by THIS user)
+    // and otherwise runs the fresh-login store-count resolution (the
+    // chooser is allowed only in this context).
+    const rawIntended = intended || searchParams.get('intended') || searchParams.get('redirect')
+    const targetPath = await authedHome('fresh-login', rawIntended)
 
     // ✅ تنظيف أي flow قديم
 delete (window as any).__OAUTH_SECURE_DATA__
@@ -144,6 +161,9 @@ const bc = new BroadcastChannel('auth_sync_channel')
 
 bc.postMessage({
   type: 'AUTH_LOGIN_SYNC',
+  // So AuthProvider's channel in THIS tab ignores our own message and
+  // doesn't fire a second, delayed redirect (see lib/auth-tab-id.ts).
+  senderId: AUTH_TAB_ID,
   userPayload: {
     authenticated: true,
     user: data.user,
@@ -155,12 +175,20 @@ bc.postMessage({
   clearAuthFlows: true,
 })
 
-    await refreshUser()
-    await queryClient.invalidateQueries({ queryKey: ['auth-user'] })
-    
+    // Navigate FIRST. `status` and the `['auth-user']` cache are already
+    // set above, so the destination renders authenticated immediately.
+    // `refreshUser()` / `invalidateQueries()` were previously awaited here
+    // — that delayed this `router.replace` by two `/auth/me` round-trips,
+    // and on a slow connection it fired long after the user had already
+    // left `/login` (picked a store), dragging them back to `/select-store`
+    // and leaving that as a Back-reachable entry. They are cache warm-ups,
+    // not gates: run them after, non-blocking.
     startTransition(() => {
       router.replace(targetPath)
     })
+
+    refreshUser().catch(() => {})
+    queryClient.invalidateQueries({ queryKey: ['auth-user'] }).catch(() => {})
   }, [queryClient, router, searchParams, intended, refreshUser])
 
 useEffect(() => {

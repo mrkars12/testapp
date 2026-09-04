@@ -15,7 +15,7 @@ export interface UploadResult {
  */
 export async function uploadToR2(
   file: File,
-  folder: 'products' | 'variants',
+  folder: 'products' | 'variants' | 'collections',
   onProgress?: (pct: number) => void
 ): Promise<UploadResult> {
   const { data: presigned } = await api.post('/uploads/presign', {
@@ -58,7 +58,7 @@ function uploadWithProgress(url: string, file: File, onProgress?: (pct: number) 
 }
 
 /** يأكد إن ملف اترفع فعليًا وربطه بمنتج/فارينت معين — بيتنادى بعد نجاح الحفظ */
-export async function confirmUpload(key: string, attachedType: 'product' | 'variant', attachedId: string): Promise<void> {
+export async function confirmUpload(key: string, attachedType: 'product' | 'variant' | 'collection', attachedId: string): Promise<void> {
   try {
     await api.post('/uploads/confirm', { key, attachedType, attachedId });
   } catch {

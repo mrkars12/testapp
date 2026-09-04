@@ -10,7 +10,14 @@ import type { Mode } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { LedgerService } from '../../ledger/ledger.service';
 import { OutboxService } from '../../common/messaging/outbox.service';
+import { IdempotencyService } from '../../common/idempotency/idempotency.service';
+import { fingerprintRequest } from '../../common/idempotency/idempotency.types';
+import { incrementInventory } from '../inventory/inventory-claim';
 import { canTransitionIntent } from './payment-intent.state';
+import { releaseCartSlot } from '../cart/cart-slot';
+
+/** Idempotency scope for cancelling an order. */
+export const CANCEL_SCOPE = 'payments.cancel';
 
 /**
  * ==================================================================
@@ -38,6 +45,7 @@ export class OrderCancellationService {
     private readonly prisma: PrismaService,
     private readonly ledger: LedgerService,
     private readonly outbox: OutboxService,
+    private readonly idempotency: IdempotencyService,
   ) {}
 
   async cancelOrder(
@@ -47,20 +55,56 @@ export class OrderCancellationService {
       mode?: Mode;
       reason?: string;
       restock?: boolean;
+      idempotencyKey?: string;
     } = {},
   ) {
     const mode: Mode = options.mode ?? 'live';
     const restock = options.restock ?? true;
 
-    const order = await this.prisma.guarded().order.findFirst({
-      where: {
-        id: BigInt(orderId),
-        store_id: storeId,
+    return this.idempotency.runExclusive(
+      {
+        storeId,
+        mode,
+        scope: CANCEL_SCOPE,
+        idempotencyKey: options.idempotencyKey,
+        fingerprint: fingerprintRequest({
+          method: 'POST',
+          path: `/stores/payments/orders/${orderId}/cancel`,
+          body: { mode, reason: options.reason ?? null, restock },
+        }),
       },
-      include: {
-        items: true,
+      () => this.runCancellation(storeId, orderId, mode, restock, options.reason),
+      {
+        inFlightMessage:
+          'This cancellation is already being processed. Please wait a moment.',
       },
-    });
+    );
+  }
+
+  /** The actual cancellation. Split out so idempotency can wrap it. */
+  private async runCancellation(
+    storeId: bigint,
+    orderId: string,
+    mode: Mode,
+    restock: boolean,
+    reason?: string,
+  ) {
+    const options = { reason };
+
+    const order = await this.prisma.withTenantTransaction(
+      storeId,
+      mode,
+      (tx) =>
+        tx.order.findFirst({
+          where: {
+            id: BigInt(orderId),
+            store_id: storeId,
+          },
+          include: {
+            items: true,
+          },
+        }),
+    );
 
     if (!order) {
       throw new NotFoundException('Order not found.');
@@ -84,18 +128,23 @@ export class OrderCancellationService {
 
     const checkoutId = order.checkout_id;
 
-    const intent = await this.prisma.guarded().paymentIntent.findFirst({
-      where: {
-        store_id: storeId,
-        mode,
-        context_kind: 'checkout',
-        context_id: checkoutId.toString(),
-      },
-      select: {
-        id: true,
-        status: true,
-      },
-    });
+    const intent = await this.prisma.withTenantTransaction(
+      storeId,
+      mode,
+      (tx) =>
+        tx.paymentIntent.findFirst({
+          where: {
+            store_id: storeId,
+            mode,
+            context_kind: 'checkout',
+            context_id: checkoutId.toString(),
+          },
+          select: {
+            id: true,
+            status: true,
+          },
+        }),
+    );
 
     if (intent && !canTransitionIntent(intent.status, 'cancelled')) {
       throw new ConflictException(
@@ -104,20 +153,25 @@ export class OrderCancellationService {
     }
 
     // The entry opened at commitment. Its absence means nothing to reverse.
-    const commitmentEntry = await this.prisma.guarded().journalEntry.findFirst({
-      where: {
-        dedupe_key: `checkout:${checkoutId}:commit`,
-        store_id: storeId,
-        mode,
-      },
-      select: {
-        id: true,
-      },
-    });
+    const commitmentEntry = await this.prisma.withTenantTransaction(
+      storeId,
+      mode,
+      (tx) =>
+        tx.journalEntry.findFirst({
+          where: {
+            dedupe_key: `checkout:${checkoutId}:commit`,
+            store_id: storeId,
+            mode,
+          },
+          select: {
+            id: true,
+          },
+        }),
+    );
 
     const now = new Date();
 
-    const result = await this.prisma.guarded().$transaction(async (tx) => {
+    const result = await this.prisma.withTenantTransaction(storeId, mode, async (tx) => {
       // Compare-and-set claim: only one caller can move the order out of
       // its current status, so restock and reversal happen exactly once.
       const claimed = await tx.order.updateMany({
@@ -172,15 +226,15 @@ export class OrderCancellationService {
             continue;
           }
 
-          await tx.productVariant.update({
-            where: {
-              id: variant.id,
-            },
-            data: {
-              inventory_qty: {
-                increment: item.qty,
-              },
-            },
+          // Same store-scoped statement the decrements use. An
+          // increment needs no availability guard — it cannot breach
+          // the inventory floor — but it does need the ownership
+          // predicate, which this path already asserted above and now
+          // carries into the write itself.
+          await incrementInventory(tx, {
+            storeId,
+            variantId: variant.id,
+            quantity: item.qty,
           });
 
           restocked += 1;
@@ -208,6 +262,24 @@ export class OrderCancellationService {
         data: {
           status: 'failed',
         },
+      });
+
+      /*
+       * And the cart's slot goes back with the reservations.
+       *
+       * A cancelled order ends this checkout, so the cart must not keep
+       * pointing at it — otherwise the shopper's basket stays locked to
+       * a purchase that no longer exists. Beside the reservation
+       * release above, inside the same transaction, for the same
+       * reason: a slot released by a separate write is a slot that can
+       * be lost.
+       *
+       * A no-op for a checkout with no cart.
+       */
+      await releaseCartSlot(tx, {
+        checkoutId,
+        storeId,
+        mode,
       });
 
       if (intent) {

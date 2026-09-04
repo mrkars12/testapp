@@ -1,160 +1,82 @@
 'use client'
 
 import { useRouter } from 'next/navigation'
-import { useEffect, useState, } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import api from '@/lib/api'
-import AuthNavigationLinks from '@/components/AuthNavigationLinks'
 
-type AccountType = 'individual' | 'business'
-
+/**
+ * There is no personal/business choice in signup anymore — this step used
+ * to ask the visitor to pick an account type before continuing. Now it just
+ * silently starts the (still HMAC-signed) registration flow as
+ * 'individual' and moves straight to the single unified signup form.
+ *
+ * ROOT CAUSE OF "/register redirects to /login" (see
+ * FINAL_SIGNUP_ROUTE_REDIRECT_FIX_REPORT.md): this used to call
+ * `router.replace('/login')` whenever `POST /auth/register/start` failed
+ * for ANY reason — a network error, CORS, a misconfigured API URL, or the
+ * backend being briefly unreachable. That made the public registration
+ * route's mere reachability depend on a live network call succeeding,
+ * which it must never do. On failure this now stays on `/register` and
+ * offers a retry instead of silently sending the visitor to login.
+ */
 export default function RegisterStep1() {
   const router = useRouter()
+  const startedRef = useRef(false)
+  const [failed, setFailed] = useState(false)
+  const [retryKey, setRetryKey] = useState(0)
 
-  const [type, setType] = useState<AccountType>('individual')
-  const [hydrated, setHydrated] = useState(false)
-  const [loading, setLoading] = useState(false)
-
-  /* =========================
-     🧠 Hydration-safe init
-  ========================= */
   useEffect(() => {
-  try {
-    const stored =
-      (sessionStorage.getItem('register_accounttype') as AccountType) ||
-      'individual'
+    if (startedRef.current) return
+    startedRef.current = true
 
-    setType(stored)
-  } catch {
-    setType('individual')
-  } finally {
-    setHydrated(true)
-  }
-}, [])
+    const start = async () => {
+      setFailed(false)
+      try {
+        const res = await api.post('/auth/register/start', {
+          accounttype: 'individual',
+        })
 
-  /* =========================
-     ⚡ تغيير فوري
-  ========================= */
-  const handleTypeChange = (val: AccountType) => {
-    setType(val)
-    sessionStorage.setItem('register_accounttype', val)
-  }
+        const { flow_id, flow_signature } = res.data
 
-  /* =========================
-     ▶️ Next step
-  ========================= */
-  const handleNext = async () => {
-    if (loading) return
-    setLoading(true)
+        if (!flow_id || !flow_signature) {
+          setFailed(true)
+          return
+        }
 
-    try {
-      const res = await api.post('/auth/register/start', {
-        accounttype: type,
-      })
-
-      const { flow_id, flow_signature } = res.data
-
-      if (!flow_id || !flow_signature) {
-        alert('Flow initialization failed')
-        return
+        router.replace(
+          `/register/account-information?flow=${flow_id}&sig=${flow_signature}`,
+        )
+      } catch {
+        setFailed(true)
+      } finally {
+        startedRef.current = false
       }
-
-      router.push(
-  `/register/account-information?flow=${flow_id}&sig=${flow_signature}&type=${type}`
-)
-
-
-    } catch {
-      alert('فشل بدء التسجيل')
-    } finally {
-      setLoading(false)
     }
+
+    start()
+  }, [router, retryKey])
+
+  if (failed) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <div className="max-w-sm w-full text-center space-y-4">
+          <p className="text-gray-700 dark:text-gray-300">
+            تعذر بدء عملية إنشاء الحساب. يرجى المحاولة مرة أخرى.
+          </p>
+          <button
+            onClick={() => setRetryKey((k) => k + 1)}
+            className="w-full py-3 rounded-xl bg-blue-600 text-white font-semibold hover:bg-blue-700"
+          >
+            إعادة المحاولة
+          </button>
+        </div>
+      </div>
+    )
   }
 
-  if (!hydrated) {
   return (
     <div className="min-h-screen flex items-center justify-center">
       <div className="w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" />
-    </div>
-  )
-}
-
-
-  return (
-    <div className="min-h-screen bg-gradient-to-b from-gray-50 to-white flex flex-col justify-center py-12 px-4">
-      <div className="max-w-md mx-auto w-full">
-        <div className="bg-white p-8 rounded-2xl shadow-lg border borFder-gray-200">
-          <h2 className="text-2xl font-bold text-gray-900 text-center mb-8">
-            اختر نوع حسابك
-          </h2>
-
-          <div className="mb-8 space-y-4">
-            <AccountRadio
-              label="حساب فردي"
-              subtitle="Personal"
-              desc="مثالي للأفراد والاستخدام الشخصي"
-              checked={type === 'individual'}
-              onClick={() => handleTypeChange('individual')}
-            />
-
-            <AccountRadio
-              label="حساب تجاري"
-              subtitle="Small Business"
-              desc="مصمم للشركات والأعمال"
-              checked={type === 'business'}
-              onClick={() => handleTypeChange('business')}
-            />
-          </div>
-
-          <button
-            onClick={handleNext}
-            disabled={loading}
-            className="w-full py-3.5 rounded-xl bg-blue-600 text-white font-semibold hover:bg-blue-700 disabled:opacity-70"
-          >
-            {loading ? 'جاري التحميل...' : 'التالي'}
-          </button>
-
-        <AuthNavigationLinks />
-          
-        </div>
-      </div>
-    </div>
-  )
-}
-
-/* =========================
-   ♻️ Component
-========================= */
-function AccountRadio({
-  label,
-  subtitle,
-  desc,
-  checked,
-  onClick,
-}: any) {
-  return (
-    <div
-      onClick={onClick}
-      className={`cursor-pointer p-6 border-2 rounded-xl transition ${
-        checked
-          ? 'border-blue-600 bg-blue-50'
-          : 'border-gray-200 hover:border-blue-300'
-      }`}
-    >
-      <div className="flex gap-4 items-start">
-        <div
-          className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${
-            checked ? 'border-blue-600' : 'border-gray-300'
-          }`}
-        >
-          {checked && <div className="w-2.5 h-2.5 bg-blue-600 rounded-full" />}
-        </div>
-
-        <div>
-          <div className="font-bold">{label}</div>
-          <div className="text-sm text-blue-600 font-semibold">{subtitle}</div>
-          <p className="text-sm text-gray-500 mt-1">{desc}</p>
-        </div>
-      </div>
     </div>
   )
 }

@@ -101,7 +101,11 @@ export class OAuthController {
 
   private buildState(fingerprint: string, action: string, req: Request): string {
     let resolvedAction = action || 'login';
-    let intendedPath = '/dashboard'; // الافتراضي
+    // Empty, not '/dashboard': an empty intendedPath means "no explicit
+    // destination was requested", which lets the frontend fall back to the
+    // store-count resolution (Part 12) instead of always landing on the
+    // account dashboard.
+    let intendedPath = '';
 
     if (req.headers.referer) {
       const refererUrl = new URL(req.headers.referer);
@@ -141,12 +145,13 @@ export class OAuthController {
       const result = await this.oauthService.handleOAuthUser(dto, res);
       
       const stateObj = req.query?.state ? JSON.parse(Buffer.from(req.query.state, 'base64').toString()) : {};
-      const targetPath = stateObj.intendedPath || '/dashboard';
+      const targetPath = stateObj.intendedPath || '';
+      const intendedQuery = targetPath ? `&intended=${encodeURIComponent(targetPath)}` : '';
 
       switch (result.status) {
         case 'success':
           return res.redirect(
-            `${frontendUrl}/auth/oauth-success?session_id=${result.sessionId}&intended=${encodeURIComponent(targetPath)}`
+            `${frontendUrl}/auth/oauth-success?session_id=${result.sessionId}${intendedQuery}`
           );
 
         // 🍏 التعديل المطلوب والأمن: تشفير التوكن عبر دالة encryptMsg وتحويله صامتاً لصفحة النجاح

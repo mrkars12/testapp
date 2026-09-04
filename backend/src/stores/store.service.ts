@@ -1,11 +1,19 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 
 import { PrismaService } from '../prisma/prisma.service';
 import type { store as StoreRecord } from '@prisma/client';
+import * as bcrypt from 'bcrypt';
+import {
+  assertNotReservedSlug,
+  assertSupportedCurrency,
+  defaultStoreThemeData,
+  normalizeStoreSlug,
+} from './store-defaults';
 import { CreateSectionDto } from './dtos/create-section.dto';
 import { UpdateSectionDto } from './dtos/update-section.dto';
 import { ReorderSectionsDto } from './dtos/reorder-sections.dto';
@@ -30,6 +38,7 @@ export class StoreService {
       where: {
         ownerId: BigInt(userId),
       },
+      orderBy: { createdAt: 'asc' },
       include: {
         theme: true,
         sections: true,
@@ -37,69 +46,96 @@ export class StoreService {
     });
   }
 
-  async createStore(userId: any, data: any) {
-    const now = new Date();
-    const store = await this.prisma.store.create({
+  /**
+   * Creates a store for the authenticated user. Also doubles as the
+   * completion step for a brand-new social-login account (Part 9/10): if
+   * `password`/`first_name`/`last_name` are supplied AND the account
+   * currently has no password (i.e. it was created via OAuth and never had
+   * one — `password === ''`), they're applied to the SAME user record here.
+   * Guarded by that empty-password check so this can never be used to
+   * silently overwrite an existing credential on a regular "create another
+   * store" call — those simply don't pass these fields, and even if they
+   * did, a non-empty existing password makes this a no-op for them.
+   */
+  private async maybeCompleteOAuthProfile(ownerId: bigint, data: any) {
+    if (!data.password) return;
+
+    const user = await this.prisma.users.findUnique({ where: { id: ownerId } });
+    if (!user || user.password) return; // already has a password — ignore
+
+    if (typeof data.password !== 'string' || data.password.length < 8) {
+      throw new BadRequestException('كلمة المرور يجب أن تكون 8 أحرف على الأقل');
+    }
+
+    // `users` has no dedicated first_name/last_name columns (see
+    // FINAL_AUTH_SIGNUP_TECHNICAL_REPAIR_REPORT.md) — `fullname` is updated
+    // instead when both are supplied, otherwise left as-is.
+    const hashedPassword = await bcrypt.hash(data.password, 10);
+    const fullname =
+      data.first_name && data.last_name
+        ? `${data.first_name} ${data.last_name}`.trim()
+        : user.fullname;
+
+    await this.prisma.users.update({
+      where: { id: ownerId },
       data: {
-        name: data.name,
-        slug: data.slug,
-        description: data.description || null,
-        currency: data.currency || 'SAR',
-        status: 1,
-        ownerId: BigInt(userId),
-        createdAt: new Date(),
-        updatedAt: new Date(),
+        password: hashedPassword,
+        fullname,
       },
     });
+  }
+
+  async createStore(userId: any, data: any) {
+    const now = new Date();
+    const ownerId = BigInt(userId);
+
+    await this.maybeCompleteOAuthProfile(ownerId, data);
+
+    // First store for this owner becomes their default automatically —
+    // there is no ambiguity (it is their only store). Any subsequent
+    // store must never silently displace an existing default; only the
+    // explicit "set default" endpoint may change it.
+    const existingCount = await this.prisma.store.count({
+      where: { ownerId },
+    });
+
+    const slug = normalizeStoreSlug(data.slug || data.name);
+    assertNotReservedSlug(slug);
+    const currency = assertSupportedCurrency(data.currency);
+
+    const taken = await this.prisma.store.findUnique({ where: { slug } });
+    if (taken) {
+      throw new ConflictException('رابط المتجر مستخدم بالفعل، اختر رابطاً آخر');
+    }
+
+    let store: StoreRecord;
+    try {
+      store = await this.prisma.store.create({
+        data: {
+          name: data.name,
+          slug,
+          description: data.description || null,
+          currency,
+          status: 1,
+          ownerId,
+          createdAt: now,
+          updatedAt: now,
+          is_default: existingCount === 0,
+        },
+      });
+    } catch (err: any) {
+      // Race: two concurrent creations (e.g. a double-submit) normalized to
+      // the same slug and both passed the findUnique check above — the DB's
+      // unique constraint is the actual source of truth.
+      if (err?.code === 'P2002') {
+        throw new ConflictException('رابط المتجر مستخدم بالفعل، اختر رابطاً آخر');
+      }
+      throw err;
+    }
 
     // Create default theme for the store
     await this.prisma.guarded().storeTheme.create({
-      data: {
-        store_id: store.id,
-        colors: {
-          primary: '#2563eb',
-          secondary: '#64748b',
-          accent: '#f59e0b',
-          background: '#ffffff',
-          surface: '#f8fafc',
-          textPrimary: '#0f172a',
-          textSecondary: '#64748b',
-          textMuted: '#94a3b8',
-          border: '#e2e8f0',
-          headerBg: '#ffffff',
-          headerText: '#0f172a',
-          footerBg: '#0f172a',
-          footerText: '#ffffff',
-        },
-        typography: {
-          headingFont: 'Inter',
-          bodyFont: 'Inter',
-          baseSize: '16px',
-          scale: 1.25,
-          h1Size: '2.5rem',
-          h2Size: '2rem',
-          h3Size: '1.5rem',
-          lineHeight: 1.6,
-          letterSpacing: 'normal',
-        },
-        header: {
-          showSearch: true,
-          showAccount: true,
-          showCart: true,
-          sticky: false,
-          background: '#ffffff',
-          textColor: '#0f172a',
-          logoPosition: 'left',
-          menuPosition: 'center',
-        },
-        footer: {
-          showNewsletter: true,
-          showSocialLinks: true,
-          columns: 4,
-          background: '#0f172a',
-          textColor: '#ffffff',
-        },
-      },
+      data: defaultStoreThemeData(store.id),
     });
 
     return store;
@@ -127,6 +163,68 @@ export class StoreService {
         updatedAt: new Date(),
       },
     });
+  }
+
+  /**
+   * Sets one of the authenticated user's own stores as their default.
+   *
+   * Ownership is proven by looking the store up scoped to `ownerId`
+   * (identical pattern to updateStore/ActiveStoreService) — the caller
+   * never supplies ownerId/userId, only the target slug. A foreign or
+   * nonexistent slug both produce the same NotFoundException, so this
+   * never reveals whether another user's store exists.
+   *
+   * Atomicity: both writes (unset the previous default, set the new
+   * one) run inside a single transaction, and the database still has
+   * the partial unique index (`store_owner_default_unique`) as the
+   * final enforcement layer in case of any application-level ordering
+   * mistake or concurrent transaction interleaving.
+   */
+  async setDefaultStore(userId: any, slug: string) {
+    const ownerId = BigInt(userId);
+
+    const store = await this.prisma.store.findFirst({
+      where: { slug, ownerId },
+    });
+
+    if (!store) throw new NotFoundException('Store not found');
+
+    if (store.is_default) {
+      return store;
+    }
+
+    try {
+      const [, updated] = await this.prisma.$transaction([
+        this.prisma.store.updateMany({
+          where: { ownerId, is_default: true },
+          data: { is_default: false, updatedAt: new Date() },
+        }),
+        this.prisma.store.update({
+          where: { id: store.id },
+          data: { is_default: true, updatedAt: new Date() },
+        }),
+      ]);
+
+      return updated;
+    } catch (error) {
+      // The DB-level partial unique index (store_owner_default_unique) is
+      // the real enforcement layer: under a genuine race between two
+      // concurrent "set default" requests for the same owner, Postgres
+      // makes the second writer wait and then fails it with P2002 rather
+      // than allowing two defaults to exist, even momentarily. Translate
+      // that into a normal, safe-to-retry conflict instead of a raw 500.
+      if (
+        error &&
+        typeof error === 'object' &&
+        'code' in error &&
+        (error as { code?: string }).code === 'P2002'
+      ) {
+        throw new ConflictException(
+          'Default store changed concurrently — please retry',
+        );
+      }
+      throw error;
+    }
   }
 
   // =====================

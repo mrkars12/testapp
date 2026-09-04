@@ -24,9 +24,11 @@ export class CodAdapter implements IPaymentProvider {
     methods: ['cod'],
     currencies: 'all',
     exponentOverrides: {},
+    automaticCapture: false,
     manualCapture: false,
     partialCapture: false,
     multiCapture: false,
+    refundSupported: false,
     partialRefund: false,
     voidSupported: false,
     authorizationExpiry: false,
@@ -37,6 +39,8 @@ export class CodAdapter implements IPaymentProvider {
     statusPolling: false,
     settlementReports: false,
     webhookResolution: 'none',
+    // Nothing to show the customer: the courier collects on delivery.
+    nextActionKinds: [],
     offlineCommitmentKind: 'promise_accepted',
   }
 

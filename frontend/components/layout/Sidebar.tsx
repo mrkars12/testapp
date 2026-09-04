@@ -2,18 +2,10 @@
 
 import { useState, useRef, useEffect } from 'react'
 import Link from 'next/link'
-import { usePathname, useRouter } from 'next/navigation'
+import { usePathname, useRouter, useParams } from 'next/navigation'
+import { useStoreBootstrap, resolveOriginalStoreSlug } from '@/lib/storeBootstrap'
 import SidebarDropdown from './SidebarDropdown'
-import { API_URL } from '@/lib/config'
-
-import { 
-  HomeIcon, 
-  CurrencyEuroIcon, 
-  DevicePhoneMobileIcon,
-  PaperAirplaneIcon,
-  CubeIcon,
-  GiftIcon
-} from '@heroicons/react/24/outline'
+import StoreSwitcher from './StoreSwitcher'
 import { useAuth } from '@/components/AuthProvider'
 
 export default function Sidebar() {
@@ -22,13 +14,26 @@ export default function Sidebar() {
   const [profileOpen, setProfileOpen] = useState(false)
   const pathname = usePathname()
   const router = useRouter()
+  const params = useParams()
+  // The ACTIVE store is the URL segment and nothing else. This previously
+  // fell back to an in-memory mirror, which could name a store the user was
+  // no longer in.
+  const activeStoreSlug = typeof params?.storeSlug === 'string' ? params.storeSlug : null
+
+  // On store-agnostic routes (/dashboard, /exchange, /settings/...) the URL
+  // names no store and the mirror may be empty, so nav links used to fall
+  // back to slug-free paths like `/store/orders`. Those are
+  // redirect stubs: clicking one rendered a full-screen "جارٍ فتح
+  // المتجر..." spinner, fetched the store list, and only THEN navigated to
+  // the real page — a visible double navigation on every such click.
+  //
+  // The store list is already bootstrapped by the protected layout, so the
+  // landing store is known here without any extra request. Resolving it up
+  // front lets every link point straight at its final URL.
+  const bootstrapStores = useStoreBootstrap((st) => st.stores)
+  const navStoreSlug = activeStoreSlug ?? resolveOriginalStoreSlug(bootstrapStores)
   const { user, logout } = useAuth()
   const [openDropdowns, setOpenDropdowns] = useState<Set<string>>(new Set());
-
-  // 🆕 slug المتجر الحالي بتاع المستخدم — بنجيبه مرة واحدة عشان نبني بيه
-  // لينكات زي /settings/payments اللي محتاجة storeSlug في الـ URL.
-  // نفس الطريقة المستخدمة في app/(protected)/stores-building/[storeSlug]/settings/page.tsx
-  const [storeSlug, setStoreSlug] = useState<string | null>(null)
 
   const profileButtonRef = useRef<HTMLButtonElement>(null)
   const profileMenuRef = useRef<HTMLDivElement>(null)
@@ -73,37 +78,44 @@ const isDropdownOpen = (id: string) => openDropdowns.has(id);
     }
   }, [])
 
-  // 🆕 جلب أول متجر بتاع المستخدم عشان نعرف الـ slug بتاعه.
-  // بنفس فكرة fetchStoreData بتاعة صفحة settings، بس هنا بناخد أول متجر
-  // بما إن كل يوزر حالياً عنده متجر واحد بس (getStore بيستخدم findFirst).
-  useEffect(() => {
-    const fetchStoreSlug = async () => {
-      try {
-        const res = await fetch(`${API_URL}/stores`, { credentials: 'include' })
-        if (!res.ok) return
-        const stores = await res.json()
-        if (Array.isArray(stores) && stores[0]?.slug) {
-          setStoreSlug(stores[0].slug)
-        }
-      } catch {
-        // تجاهل بصمت — اللينك هيفضل معطل لحد ما البيانات توصل
-      }
-    }
-    fetchStoreSlug()
-  }, [])
-
   const isActive = (paths: string | string[]) => {
     if (!pathname) return false
     const arr = Array.isArray(paths) ? paths : [paths]
 
+    // Nav targets are written slug-free (`/store/products`) but
+    // the live path carries the store segment
+    // (`/store/acme/products`). Compare against the path with
+    // that segment stripped, so highlighting doesn't silently stop working
+    // for every store-scoped route.
+    const slugFreePath = pathname.replace(
+      /^\/store\/[^/]+(?=\/)/,
+      '/store',
+    )
+
     return arr.some(p =>
       pathname === p ||
-      pathname.startsWith(p + '/')
+      pathname.startsWith(p + '/') ||
+      slugFreePath === p ||
+      slugFreePath.startsWith(p + '/')
     )
   }
 
-  // 🆕 مسار Payments الحقيقي — بيتبني بس لو عندنا storeSlug فعلي
-  const paymentsHref = storeSlug ? `/stores-building/${storeSlug}/settings/payments` : null
+  // Store-scoped admin routes live under `/store/[storeSlug]/…`
+  // — the slug in the URL is what makes a store active, so every nav link
+  // has to carry it. `navStoreSlug` covers the store-agnostic case too, so
+  // the slug-free stub (and its redirect hop) is only reached in the one
+  // situation where nothing can be resolved: the store list has not loaded
+  // yet, or the user owns no store at all.
+  const s = (subPath: string) =>
+    navStoreSlug ? `/store/${navStoreSlug}/${subPath}` : `/store/${subPath}`
+  const paymentsHref = s('settings/payments')
+  // The store ROOT is Dashboard — a distinct destination from every
+  // section beneath it. This must never share `isActive`'s prefix-matching
+  // with a section link (Dashboard would then also light up on
+  // `/store/<slug>/products`, since that path starts with the root path),
+  // so its active check is a plain exact match, done separately below.
+  const dashboardHref = navStoreSlug ? `/store/${navStoreSlug}` : '/store'
+  const isDashboardActive = pathname === dashboardHref || pathname === '/store'
 
   return (
     <aside
@@ -118,18 +130,23 @@ const isDropdownOpen = (id: string) => openDropdowns.has(id);
         <img src="/assets/images/888.png" alt="DartCoin" className="h-10" />
       </div>
 
+      {/* ── Store Switcher ── */}
+      <div className="px-3 pb-2">
+        <StoreSwitcher />
+      </div>
+
       {/* Menu */}
       <nav className="flex flex-1 flex-col overflow-auto gap-2 p-3">
   
-        {/* Dashboard */}
+        {/* Dashboard — the store ROOT (/store/<slug>), not the account /dashboard. */}
         <Link
-          href="/dashboard"
-          className={`flex p-2 items-center h-6 p-2 gap-2 mb-1 text-sm text-left 
-          rounded-md outline-none  
+          href={dashboardHref}
+          className={`flex p-2 items-center h-6 p-2 gap-2 mb-1 text-sm text-left
+          rounded-md outline-none
           transition-[width,height,padding] duration-150 ease-in-out
           text-[#0097c7] no-underline
           hover:bg-[hsl(240_4.8%_95.9%)] hover:text-[#0097c7] ${
-            isActive('/dashboard')
+            isDashboardActive
               ? 'hover:text-[#0097c7] bg-[hsl(240_4.8%_95.9%)]'
               : 'hover:bg-[hsl(240_4.8%_95.9%)]'
           }`}
@@ -198,20 +215,20 @@ const isDropdownOpen = (id: string) => openDropdowns.has(id);
             Stores Management
           </p>
 
+          {/*
+            "المتاجر" (store list) and "إضافة متجر" (create store) used to
+            live here. Both are store-agnostic actions, not store-scoped
+            navigation, and this section is exclusively the latter now —
+            creating a store lives in the Store Switcher instead
+            ("إنشاء متجر جديد"), which is where a merchant already is when
+            they need to add one, rather than a second, redundant entry
+            point in the main nav. Seeing every store is the post-login
+            chooser's job (`/select-store`), not a permanent Sidebar link.
+          */}
           <Link
-            href="/stores-building"
+            href={s('pages')}
             className={`flex p-2 items-center h-6 gap-2 mb-1 text-sm rounded-md outline-none transition-all duration-150 text-[#0097c7] no-underline hover:bg-[hsl(240_4.8%_95.9%)] ${
-              isActive('/stores-building') && pathname === '/stores-building' ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
-            }`}
-          >
-            <i className="fas fa-store text-lg w-[1.2rem] h-[1.2rem]"></i>
-            <span className="flex-1 truncate font-sans font-medium text-[#333]">Create Store</span>
-          </Link>
-
-          <Link
-            href="/stores-building/pages"
-            className={`flex p-2 items-center h-6 gap-2 mb-1 text-sm rounded-md outline-none transition-all duration-150 text-[#0097c7] no-underline hover:bg-[hsl(240_4.8%_95.9%)] ${
-              isActive('/stores-building/pages') ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
+              isActive('/store/pages') ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
             }`}
           >
             <i className="fas fa-file-alt text-lg w-[1.2rem] h-[1.2rem]"></i>
@@ -219,9 +236,9 @@ const isDropdownOpen = (id: string) => openDropdowns.has(id);
           </Link>
 
           <Link
-            href="/stores-building/menus"
+            href={s('menus')}
             className={`flex p-2 items-center h-6 gap-2 mb-1 text-sm rounded-md outline-none transition-all duration-150 text-[#0097c7] no-underline hover:bg-[hsl(240_4.8%_95.9%)] ${
-              isActive('/stores-building/menus') ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
+              isActive('/store/menus') ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
             }`}
           >
             <i className="fas fa-bars text-lg w-[1.2rem] h-[1.2rem]"></i>
@@ -229,9 +246,9 @@ const isDropdownOpen = (id: string) => openDropdowns.has(id);
           </Link>
 
           <Link
-            href="/stores-building/products"
+            href={s('products')}
             className={`flex p-2 items-center h-6 gap-2 mb-1 text-sm rounded-md outline-none transition-all duration-150 text-[#0097c7] no-underline hover:bg-[hsl(240_4.8%_95.9%)] ${
-              isActive('/stores-building/products') ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
+              isActive('/store/products') ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
             }`}
           >
             <i className="fas fa-box text-lg w-[1.2rem] h-[1.2rem]"></i>
@@ -239,33 +256,54 @@ const isDropdownOpen = (id: string) => openDropdowns.has(id);
           </Link>
 
           <Link
-            href="/stores-building/collections"
+            href={s('orders')}
             className={`flex p-2 items-center h-6 gap-2 mb-1 text-sm rounded-md outline-none transition-all duration-150 text-[#0097c7] no-underline hover:bg-[hsl(240_4.8%_95.9%)] ${
-              isActive('/stores-building/collections') ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
+              isActive('/store/orders') ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
+            }`}
+          >
+            <i className="fas fa-receipt text-lg w-[1.2rem] h-[1.2rem]"></i>
+            <span className="flex-1 truncate font-sans font-medium text-[#333]">Orders</span>
+          </Link>
+
+          <Link
+            href={s('collections')}
+            className={`flex p-2 items-center h-6 gap-2 mb-1 text-sm rounded-md outline-none transition-all duration-150 text-[#0097c7] no-underline hover:bg-[hsl(240_4.8%_95.9%)] ${
+              isActive('/store/collections') ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
             }`}
           >
             <i className="fas fa-layer-group text-lg w-[1.2rem] h-[1.2rem]"></i>
             <span className="flex-1 truncate font-sans font-medium text-[#333]">Collections</span>
           </Link>
 
-          {/* 🔧 كان: href="/stores-building/[storeSlug]/settings/payments" (نص حرفي، مش هيشتغل)
-              دلوقتي: بيتبني ديناميكياً من storeSlug الحقيقي بتاع متجر اليوزر */}
+          {/*
+            Store settings. `isActive` is given the payments path as an
+            exclusion so this row does not also light up while the user is
+            on Payment Settings, which is nested beneath it.
+          */}
           <Link
-            href={paymentsHref ?? '#'}
-            onClick={(e) => { if (!paymentsHref) e.preventDefault() }}
-            aria-disabled={!paymentsHref}
+            href={s('settings')}
             className={`flex p-2 items-center h-6 gap-2 mb-1 text-sm rounded-md outline-none transition-all duration-150 text-[#0097c7] no-underline hover:bg-[hsl(240_4.8%_95.9%)] ${
-              paymentsHref && isActive(paymentsHref) ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
-            } ${!paymentsHref ? 'opacity-50 cursor-not-allowed' : ''}`}
+              isActive(s('settings')) && !isActive(paymentsHref) ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
+            }`}
+          >
+            <i className="fas fa-gear text-lg w-[1.2rem] h-[1.2rem]"></i>
+            <span className="flex-1 truncate font-sans font-medium text-[#333]">Settings</span>
+          </Link>
+
+          <Link
+            href={paymentsHref}
+            className={`flex p-2 items-center h-6 gap-2 mb-1 text-sm rounded-md outline-none transition-all duration-150 text-[#0097c7] no-underline hover:bg-[hsl(240_4.8%_95.9%)] ${
+              isActive(paymentsHref) ? 'bg-[hsl(240_4.8%_95.9%)]' : ''
+            }`}
           >
             <i className="fas fa-credit-card text-lg w-[1.2rem] h-[1.2rem]"></i>
             <span className="flex-1 truncate font-sans font-medium text-[#333]">Payments</span>
           </Link>
 
           <Link
-            href="/stores-building/themes"
+            href={s('themes')}
             className={`flex p-2 items-center h-6 gap-2 mb-1 text-sm rounded-md outline-none transition-all duration-150 text-[#0097c7] no-underline hover:bg-[hsl(240_4.8%_95.9%)] ${
-              isActive('/stores-building/themes')
+              isActive('/store/themes')
                 ? 'bg-[hsl(240_4.8%_95.9%)]'
                 : ''
             }`}

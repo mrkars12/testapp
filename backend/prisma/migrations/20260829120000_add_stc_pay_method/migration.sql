@@ -1,0 +1,13 @@
+-- STC Pay as a payment method key.
+--
+-- Not a new payment surface: Moyasar's Embedded Payment Form hosts it
+-- as one of its own methods (`stcpay`) alongside `creditcard` and
+-- `applepay` — see the adapter's MOYASAR_PROVIDER_FORMS. This enum value
+-- is what lets a merchant switch the method on as a
+-- PaymentMethodOffering row; the grouping still resolves it to the same
+-- single embedded experience the card form already is.
+--
+-- Appended at the end of the type rather than inserted in place: the
+-- enum's sort order is not used for anything, and ADD VALUE ... BEFORE
+-- would rewrite an ordering nothing depends on.
+ALTER TYPE "PaymentMethodKey" ADD VALUE IF NOT EXISTS 'stc_pay';

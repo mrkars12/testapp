@@ -124,6 +124,77 @@ export function refundIssuedOffline(input: {
   ]
 }
 
+/**
+ * A dispute was opened and the provider is holding the money.
+ *
+ *   debit  disputes_held
+ *   credit psp_receivable   (the account the payment was taken on)
+ *
+ * The receivable drops because the provider has withheld the funds
+ * pending the outcome. Nothing is written off yet — the money is in
+ * limbo, which is exactly what disputes_held is for, and it is why this
+ * is not a loss entry.
+ *
+ * ⚠️ Mirrors refundIssued in shape: the sale is untouched. A dispute is
+ * not a reversal of revenue unless and until it is lost.
+ */
+export function disputeOpened(input: {
+  totalMinor: bigint
+  paymentAccountId: bigint
+}): PostingInput[] {
+  assertPositive(input.totalMinor, 'مبلغ النزاع')
+
+  return [
+    debit('disputes_held', input.totalMinor),
+    credit('psp_receivable', input.totalMinor, {
+      paymentAccountId: input.paymentAccountId,
+    }),
+  ]
+}
+
+/**
+ * The merchant won: the provider returns the held money.
+ *
+ *   debit  psp_receivable
+ *   credit disputes_held
+ *
+ * The exact inverse of disputeOpened, posted as a new compensating entry
+ * rather than by touching the original — the ledger is append-only.
+ */
+export function disputeWon(input: {
+  totalMinor: bigint
+  paymentAccountId: bigint
+}): PostingInput[] {
+  assertPositive(input.totalMinor, 'مبلغ النزاع')
+
+  return [
+    debit('psp_receivable', input.totalMinor, {
+      paymentAccountId: input.paymentAccountId,
+    }),
+    credit('disputes_held', input.totalMinor),
+  ]
+}
+
+/**
+ * The merchant lost: the held money is gone for good.
+ *
+ *   debit  chargeback_loss
+ *   credit disputes_held
+ *
+ * The hold clears and the amount becomes a realised expense. Revenue
+ * still stands, for the same reason refunds use refunds_contra: netting
+ * the sale away would make a chargeback indistinguishable from a sale
+ * that never happened.
+ */
+export function disputeLost(input: { totalMinor: bigint }): PostingInput[] {
+  assertPositive(input.totalMinor, 'مبلغ النزاع')
+
+  return [
+    debit('chargeback_loss', input.totalMinor),
+    credit('disputes_held', input.totalMinor),
+  ]
+}
+
 export function pspFeeEstimated(input: { amountMinor: bigint; paymentAccountId: bigint }): PostingInput[] {
   assertPositive(input.amountMinor, 'رسوم البوابة')
   return [

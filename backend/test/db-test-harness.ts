@@ -1,6 +1,8 @@
-import { PrismaClient } from '@prisma/client'
-import { TenantContextService } from '../src/common/tenant/tenant-context.service'
-import { createTenantGuardExtension } from '../src/common/tenant/tenant-guard.extension'
+import { Prisma, PrismaClient } from '@prisma/client';
+import type { ConfigService } from '@nestjs/config';
+import { TenantContextService } from '../src/common/tenant/tenant-context.service';
+import { createTenantGuardExtension } from '../src/common/tenant/tenant-guard.extension';
+import { IdempotencyService } from '../src/common/idempotency/idempotency.service';
 
 /**
  * ══════════════════════════════════════════════════════════════════
@@ -23,7 +25,11 @@ import { createTenantGuardExtension } from '../src/common/tenant/tenant-guard.ex
  * ملف اختبار. الملف ده بيتصل بيها بس.
  */
 
-let client: PrismaClient | undefined
+let client: PrismaClient | undefined;
+
+let cleanupClient: PrismaClient | undefined;
+
+let platformClient: PrismaClient | undefined;
 
 /**
  * Tables owned by the payment engine, in dependency order.
@@ -34,6 +40,14 @@ let client: PrismaClient | undefined
  * clear it — otherwise the second test fails on a unique username.
  */
 export const PAYMENT_TABLES: readonly string[] = [
+  'webhook_events',
+  // Carts come before checkouts: `checkouts.cart_id` is a plain column
+  // with no foreign key (matching `order_id` and `supersedes_id`), so
+  // the order here is documentation of the dependency rather than a
+  // constraint requirement.
+  'cart_items',
+  'carts',
+  'disputes',
   'ledger_postings',
   'journal_entries',
   'ledger_accounts',
@@ -52,7 +66,7 @@ export const PAYMENT_TABLES: readonly string[] = [
   'consumed_events',
   'outbox_messages',
   'payment_idempotency_records',
-]
+];
 
 /** Domain tables a spec seeds. Truncating these cascades widely. */
 export const FIXTURE_TABLES: readonly string[] = [
@@ -62,13 +76,13 @@ export const FIXTURE_TABLES: readonly string[] = [
   '"Product"',
   'store',
   'users',
-]
+];
 
 /** Everything a payment spec should clear between tests. */
 export const ALL_TEST_TABLES: readonly string[] = [
   ...PAYMENT_TABLES,
   ...FIXTURE_TABLES,
-]
+];
 
 /**
  * Connects to the shared container started by global-setup.
@@ -83,7 +97,34 @@ export const ALL_TEST_TABLES: readonly string[] = [
  * Exposed so a spec can set an active store and assert what the guard
  * does about it, the same way ActiveStoreGuard would in a request.
  */
-export const testTenantContext = new TenantContextService()
+export const testTenantContext = new TenantContextService();
+
+/**
+ * A real IdempotencyService on the test database.
+ *
+ * Specs that exercise an idempotent operation need the genuine article:
+ * the guarantee under test is the unique constraint on
+ * payment_idempotency_records, and a stub that always returns
+ * `{ outcome: 'proceed' }` would assert nothing about it.
+ */
+export function createTestIdempotencyService(
+  prisma: PrismaClient,
+  overrides: { ttlSeconds?: number; leaseSeconds?: number } = {},
+): IdempotencyService {
+  const config = {
+    getOrThrow: (key: string) => {
+      if (key === 'idempotency') {
+        return {
+          ttlSeconds: overrides.ttlSeconds ?? 3600,
+          leaseSeconds: overrides.leaseSeconds ?? 60,
+        };
+      }
+      throw new Error(`missing config: ${key}`);
+    },
+  } as unknown as ConfigService;
+
+  return new IdempotencyService(prisma as never, config);
+}
 
 /**
  * Gives a raw PrismaClient the same surface PrismaService exposes.
@@ -106,46 +147,166 @@ function withGuarded(raw: PrismaClient): PrismaClient {
       // separate, explicit decision.
       throwOnViolation: false,
     }),
-  )
+  );
 
-  return Object.assign(raw, { guarded: () => extended }) as PrismaClient
+  const client = Object.assign(raw, {
+    guarded: () => extended,
+
+    withTenantTransaction: async <T>(
+      storeId: bigint,
+      mode: string,
+      callback: (tx: any) => Promise<T>,
+      options?: { maxWait?: number; timeout?: number },
+    ): Promise<T> => {
+      return raw.$transaction(async (tx) => {
+        await tx.$executeRaw`
+          SELECT
+            set_config('app.store_id', ${storeId.toString()}, true),
+            set_config('app.mode', ${mode}, true)
+        `;
+
+        return callback(tx);
+      }, options);
+    },
+
+    platform: (): PrismaClient => {
+      if (platformClient) return platformClient;
+      /*
+       * THE REAL `dartstore_platform`, not the container owner.
+       *
+       * This used to borrow the owner connection, which has unrestricted
+       * access to everything — so a sweep that reached past the narrow
+       * grants production actually gives this role passed here and
+       * failed there. The platform role now has exactly the per-table
+       * privileges `20260903130000_platform_roles_grants_and_policies`
+       * grants it (SELECT on carts / payment_intents / payment_accounts,
+       * SELECT+UPDATE on outbox_messages, SELECT+INSERT+UPDATE on
+       * webhook_events, SELECT+DELETE on payment_idempotency_records),
+       * and nothing else.
+       */
+      platformClient = new PrismaClient({
+        datasources: { db: { url: getPlatformDatabaseUrl() } },
+      });
+      return platformClient;
+    },
+
+    withPlatformTransaction: async <T>(callback: (tx: any) => Promise<T>): Promise<T> => {
+      const p = (client as unknown as { platform: () => PrismaClient }).platform();
+      await p.$connect().catch(() => {});
+      return p.$transaction(async (tx) => callback(tx));
+    },
+  });
+
+  return client as PrismaClient;
+}
+
+/**
+ * The owner connection, used ONLY to clean up between tests.
+ *
+ * TRUNCATE requires ownership, and it is deliberately withheld from
+ * both runtime roles because it ignores row-level security entirely —
+ * a role that can TRUNCATE a tenant table can erase every merchant's
+ * data in one statement, policies or no policies. So cleanup cannot
+ * borrow either runtime identity and uses the owner instead.
+ */
+function getCleanupDatabaseUrl(): string {
+  const url = process.env.TEST_OWNER_DATABASE_URL;
+
+  if (!url) {
+    throw new Error(
+      'TEST_OWNER_DATABASE_URL is not set. Integration specs must run ' +
+        'through the jest-integration config, whose global setup builds ' +
+        'the database with `prisma migrate deploy`.',
+    );
+  }
+
+  return url;
+}
+
+/**
+ * The platform sweep connection — the real `dartstore_platform` role,
+ * with production's narrow grants.
+ */
+function getPlatformDatabaseUrl(): string {
+  const url = process.env.TEST_PLATFORM_DATABASE_URL;
+
+  if (!url) {
+    throw new Error(
+      'TEST_PLATFORM_DATABASE_URL is not set. Integration specs must run ' +
+        'through the jest-integration config.',
+    );
+  }
+
+  return url;
+}
+
+async function getCleanupClient(): Promise<PrismaClient> {
+  if (cleanupClient) return cleanupClient;
+
+  cleanupClient = new PrismaClient({
+    datasources: {
+      db: {
+        url: getCleanupDatabaseUrl(),
+      },
+    },
+  });
+
+  await cleanupClient.$connect();
+
+  return cleanupClient;
 }
 
 export async function startTestDatabase(): Promise<PrismaClient> {
-  if (client) return client
+  if (client) return client;
 
-  const url = process.env.TEST_DATABASE_URL
+  const url = process.env.TEST_DATABASE_URL;
 
   if (!url) {
     throw new Error(
       'TEST_DATABASE_URL is not set. Integration specs must run through ' +
         'test/jest-integration.json so global-setup starts the container.',
-    )
+    );
   }
 
-  client = withGuarded(new PrismaClient({ datasources: { db: { url } } }))
-  await client.$connect()
+  client = withGuarded(new PrismaClient({ datasources: { db: { url } } }));
+  await client.$connect();
 
-  return client
+  return client;
 }
 
 export function getTestClient(): PrismaClient {
   if (!client) {
     throw new Error(
       'قاعدة بيانات الاختبار لسه ماقامتش — نادِ startTestDatabase() في beforeAll.',
-    )
+    );
   }
-  return client
+  return client;
+}
+
+export async function withTestTenant<T>(
+  storeId: bigint,
+  callback: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+  const db = getTestClient();
+
+  return db.$transaction(async (tx) => {
+    await tx.$executeRaw`
+      SELECT set_config('app.store_id', ${storeId.toString()}, true),
+             set_config('app.mode', 'live', true)
+    `;
+
+    return callback(tx);
+  });
 }
 
 export function getTestDatabaseUrl(): string {
-  const url = process.env.TEST_DATABASE_URL
+  const url = process.env.TEST_DATABASE_URL;
 
   if (!url) {
-    throw new Error('TEST_DATABASE_URL is not set.')
+    throw new Error('TEST_DATABASE_URL is not set.');
   }
 
-  return url
+  return url;
 }
 
 /**
@@ -156,7 +317,7 @@ export function getTestDatabaseUrl(): string {
  * fixtures.
  */
 export async function resetTestDatabase(): Promise<void> {
-  await truncateTables(PAYMENT_TABLES)
+  await truncateTables(PAYMENT_TABLES);
 }
 
 /**
@@ -172,25 +333,27 @@ export async function resetTestDatabase(): Promise<void> {
  * a dead pool.
  */
 export async function truncateTables(tables: readonly string[]): Promise<void> {
-  const db = getTestClient()
+  const db = await getCleanupClient();
 
   try {
     await db.$executeRawUnsafe(
       `TRUNCATE TABLE ${tables.join(', ')} RESTART IDENTITY CASCADE`,
-    )
+    );
   } catch (error) {
     const blockers = await db
-      .$queryRawUnsafe<{ pid: number; state: string; query: string }[]>(`
+      .$queryRawUnsafe<{ pid: number; state: string; query: string }[]>(
+        `
         SELECT pid, state, left(query, 200) AS query
         FROM pg_stat_activity
         WHERE datname = current_database() AND pid <> pg_backend_pid()
-      `)
-      .catch(() => [])
+      `,
+      )
+      .catch(() => []);
 
     throw new Error(
       `TRUNCATE failed: ${(error as Error).message}\n` +
         `sessions on this database: ${JSON.stringify(blockers, null, 2)}`,
-    )
+    );
   }
 }
 
@@ -201,8 +364,13 @@ export async function truncateTables(tables: readonly string[]): Promise<void> {
  * has finished, not here.
  */
 export async function stopTestDatabase(): Promise<void> {
-  await client?.$disconnect()
-  client = undefined
+  await client?.$disconnect();
+  await cleanupClient?.$disconnect();
+  await platformClient?.$disconnect();
+
+  client = undefined;
+  cleanupClient = undefined;
+  platformClient = undefined;
 }
 
 /**
@@ -217,5 +385,5 @@ export async function stopTestDatabase(): Promise<void> {
 export function createAdditionalClient(): PrismaClient {
   return withGuarded(
     new PrismaClient({ datasources: { db: { url: getTestDatabaseUrl() } } }),
-  )
+  );
 }

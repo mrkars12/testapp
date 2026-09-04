@@ -1,7 +1,12 @@
 import { ProviderError } from '../../provider.types'
 import { fromStripeAmount, isThreeDecimal, isZeroDecimal, toStripeAmount } from './stripe-amount'
 import { mapStripeError, stripeErrorMessage } from './stripe-error-map'
-import { factsFromEvent, factsFromIntent, type StripeIntentLike } from './stripe-fact-map'
+import {
+  factsFromEvent,
+  factsFromIntent,
+  isRecognisedEventType,
+  type StripeIntentLike,
+} from './stripe-fact-map'
 
 const ACCOUNT = 7n
 
@@ -83,6 +88,24 @@ describe('error mapping', () => {
     expect(mapStripeError({ code: 'payment_intent_authentication_failure' })).toBe(
       'authentication_failed',
     )
+  })
+
+  it('maps the TEST "Simulate scan → reject" flow to a real reason, not unknown', () => {
+    // A non-card (redirect/QR/wallet) payment method reports its decline
+    // through `code`, not `decline_code` — this used to fall through
+    // every table here to `unknown`.
+    expect(mapStripeError({ code: 'payment_method_customer_decline' })).toBe(
+      'declined_do_not_honor',
+    )
+    expect(mapStripeError({ code: 'payment_method_provider_decline' })).toBe(
+      'declined_do_not_honor',
+    )
+  })
+
+  it('maps payment-method availability and timeout codes', () => {
+    expect(mapStripeError({ code: 'payment_method_not_available' })).toBe('method_unavailable')
+    expect(mapStripeError({ code: 'payment_method_provider_timeout' })).toBe('provider_timeout')
+    expect(mapStripeError({ code: 'authentication_failure' })).toBe('authentication_failed')
   })
 
   it('maps mode mismatch, which is otherwise mistaken for a decline', () => {
@@ -168,6 +191,67 @@ describe('fact mapping from an intent', () => {
     }
   })
 
+  it('reports a failure when a declined confirmation returns the intent to requires_payment_method', () => {
+    // Stripe has no distinct terminal "failed" PaymentIntent status: a
+    // declined card (or a rejected TEST "Simulate scan") sends the
+    // intent back to requires_payment_method with last_payment_error
+    // set. Without this, a sync/poll can never resolve such an attempt.
+    const [fact] = factsFromIntent({
+      accountId: ACCOUNT,
+      intent: intent({
+        status: 'requires_payment_method',
+        last_payment_error: { message: 'Your card was declined.' },
+      }),
+    })
+    expect(fact).toMatchObject({ factType: 'attempt_failed', gatewayReference: 'pi_1' })
+  })
+
+  it('classifies a declined confirmation into a structured failure code', () => {
+    // This is the bug that made a merchant TEST failure show "سبب الفشل:
+    // unknown": the mapper used to read only last_payment_error.message,
+    // never its decline_code — so nothing downstream had a code to show.
+    const [fact] = factsFromIntent({
+      accountId: ACCOUNT,
+      intent: intent({
+        status: 'requires_payment_method',
+        last_payment_error: {
+          decline_code: 'insufficient_funds',
+          code: 'card_declined',
+          message: 'Your card has insufficient funds.',
+        },
+      }),
+    })
+    expect(fact.failureCode).toBe('declined_insufficient_funds')
+  })
+
+  it('classifies the real TEST "Simulate scan → reject" flow, not as unknown', () => {
+    // This is the exact shape a rejected non-card TEST confirmation
+    // (Cash App Pay / PayNow / similar QR-based method's "Simulate
+    // scan" → Fail button) reports: `code` set, no `decline_code`.
+    const [fact] = factsFromIntent({
+      accountId: ACCOUNT,
+      intent: intent({
+        status: 'requires_payment_method',
+        last_payment_error: {
+          code: 'payment_method_customer_decline',
+          message: 'The customer did not approve the payment.',
+        },
+      }),
+    })
+    expect(fact.failureCode).toBe('declined_do_not_honor')
+  })
+
+  it('falls back to unknown when last_payment_error carries no classifiable code', () => {
+    const [fact] = factsFromIntent({
+      accountId: ACCOUNT,
+      intent: intent({
+        status: 'requires_payment_method',
+        last_payment_error: { message: 'Something went wrong.' },
+      }),
+    })
+    expect(fact.failureCode).toBe('unknown')
+  })
+
   it('carries charge and customer references', () => {
     const [fact] = factsFromIntent({
       accountId: ACCOUNT,
@@ -232,6 +316,48 @@ describe('fact mapping from an event', () => {
     expect(facts[0]).toMatchObject({ factType: 'attempt_failed', gatewayReference: 'pi_2' })
   })
 
+  it('maps a Checkout Session expiry to attempt_expired on its PaymentIntent', () => {
+    const facts = factsFromEvent({
+      accountId: ACCOUNT,
+      event: event('checkout.session.expired', {
+        id: 'cs_1',
+        currency: 'usd',
+        payment_intent: 'pi_4',
+      }),
+    })
+    expect(facts[0]).toMatchObject({ factType: 'attempt_expired', gatewayReference: 'pi_4' })
+  })
+
+  it('keys an abandoned Checkout Session expiry on the session id when no PaymentIntent was ever created', () => {
+    // This is the common case, not the edge case: Stripe defers creating
+    // a PaymentIntent until the customer submits payment, so a session
+    // that expires unused (the whole reason this event fires) almost
+    // always has none. `initializePayment` stores the session's own id
+    // as the attempt's gatewayReference in exactly that situation, so
+    // this fact must be keyed on it too, or it can never be matched to
+    // the attempt it belongs to.
+    const facts = factsFromEvent({
+      accountId: ACCOUNT,
+      event: event('checkout.session.expired', { id: 'cs_2', currency: 'usd', payment_intent: null }),
+    })
+    expect(facts).toMatchObject([{ factType: 'attempt_expired', gatewayReference: 'cs_2' }])
+  })
+
+  it('treats Checkout Session completed/async_payment_* as recognised no-ops — the PaymentIntent event is authoritative', () => {
+    for (const type of [
+      'checkout.session.completed',
+      'checkout.session.async_payment_succeeded',
+      'checkout.session.async_payment_failed',
+    ]) {
+      expect(isRecognisedEventType(type)).toBe(true)
+      const facts = factsFromEvent({
+        accountId: ACCOUNT,
+        event: event(type, { id: 'cs_3', payment_status: 'paid' }),
+      })
+      expect(facts).toEqual([])
+    }
+  })
+
   it('maps disputes to the reference of the payment, not the dispute', () => {
     const facts = factsFromEvent({
       accountId: ACCOUNT,
@@ -251,11 +377,182 @@ describe('fact mapping from an event', () => {
     ).toEqual([])
   })
 
+  it('maps a refunded charge using the cumulative refunded total', () => {
+    const facts = factsFromEvent({
+      accountId: ACCOUNT,
+      event: event('charge.refunded', {
+        id: 'ch_1',
+        payment_intent: 'pi_1',
+        currency: 'usd',
+        amount: 5000,
+        amount_refunded: 2000,
+        refunded: false,
+      }),
+    })
+
+    // amount_refunded, not amount: the applier reconciles refunds
+    // cumulatively, so a second partial and a redelivered first differ.
+    expect(facts[0]).toMatchObject({
+      factType: 'refund_succeeded',
+      gatewayReference: 'pi_1',
+      cumulativeAmountMinor: 2000n,
+    })
+  })
+
+  it('ignores a refunded charge with no payment intent to attach to', () => {
+    expect(
+      factsFromEvent({
+        accountId: ACCOUNT,
+        event: event('charge.refunded', {
+          id: 'ch_1',
+          currency: 'usd',
+          amount_refunded: 2000,
+        }),
+      }),
+    ).toEqual([])
+  })
+
+  it('maps a failed refund update', () => {
+    const facts = factsFromEvent({
+      accountId: ACCOUNT,
+      event: event('refund.updated', {
+        id: 're_9',
+        payment_intent: 'pi_1',
+        currency: 'usd',
+        amount: 2000,
+        status: 'failed',
+      }),
+    })
+
+    expect(facts[0]).toMatchObject({
+      factType: 'refund_failed',
+      gatewayReference: 'pi_1',
+    })
+    // Keyed per refund, so two refunds failing on one payment are two facts.
+    expect(facts[0].dedupeKey).toContain('re_9')
+  })
+
+  it('produces no fact for a succeeded refund update', () => {
+    // A single Refund carries its own amount, not the running total, and
+    // treating it as cumulative would erase an earlier partial refund.
+    // charge.refunded is the authoritative source for a successful refund.
+    expect(
+      factsFromEvent({
+        accountId: ACCOUNT,
+        event: event('refund.updated', {
+          id: 're_9',
+          payment_intent: 'pi_1',
+          currency: 'usd',
+          amount: 2000,
+          status: 'succeeded',
+        }),
+      }),
+    ).toEqual([])
+  })
+
+  it('recognises requires_action without producing a fact', () => {
+    expect(isRecognisedEventType('payment_intent.requires_action')).toBe(true)
+    expect(
+      factsFromEvent({
+        accountId: ACCOUNT,
+        event: event('payment_intent.requires_action', {
+          id: 'pi_1',
+          status: 'requires_action',
+          currency: 'usd',
+          amount: 5000,
+        }),
+      }),
+    ).toEqual([])
+  })
+
+  it('does not recognise an event type it has no mapping for', () => {
+    expect(isRecognisedEventType('invoice.payment_succeeded')).toBe(false)
+  })
+
   it('uses the event timestamp as the occurrence time', () => {
     const facts = factsFromEvent({
       accountId: ACCOUNT,
       event: event('payment_intent.succeeded', intent() as unknown as Record<string, unknown>),
     })
     expect(facts[0].occurredAt?.toISOString()).toBe('2023-11-14T22:13:20.000Z')
+  })
+})
+describe('dispute mapping', () => {
+  const disputeEvent = (type: string, object: Record<string, unknown>) => ({
+    id: 'evt_d',
+    type,
+    created: 1_700_000_000,
+    data: { object },
+  })
+
+  const dispute = (over: Record<string, unknown> = {}) => ({
+    id: 'dp_1',
+    payment_intent: 'pi_1',
+    currency: 'usd',
+    amount: 5000,
+    status: 'needs_response',
+    reason: 'fraudulent',
+    ...over,
+  })
+
+  it('maps an opened dispute with its amount', () => {
+    const [fact] = factsFromEvent({
+      accountId: ACCOUNT,
+      event: disputeEvent('charge.dispute.created', dispute()),
+    })
+
+    expect(fact).toMatchObject({
+      factType: 'dispute_opened',
+      gatewayReference: 'pi_1',
+      cumulativeAmountMinor: 5000n,
+      currency: 'USD',
+    })
+    // The dispute id keys the fact, so one payment can be disputed twice.
+    expect(fact.dedupeKey).toContain('dp_1')
+    expect(fact.refs?.gatewayCaptureRef).toBe('dp_1')
+  })
+
+  it('maps a won dispute', () => {
+    const [fact] = factsFromEvent({
+      accountId: ACCOUNT,
+      event: disputeEvent('charge.dispute.closed', dispute({ status: 'won' })),
+    })
+
+    expect(fact.factType).toBe('dispute_won')
+  })
+
+  it('maps a lost dispute', () => {
+    const [fact] = factsFromEvent({
+      accountId: ACCOUNT,
+      event: disputeEvent('charge.dispute.closed', dispute({ status: 'lost' })),
+    })
+
+    expect(fact.factType).toBe('dispute_lost')
+  })
+
+  it('maps a close with no winner to an audit-only fact', () => {
+    const [fact] = factsFromEvent({
+      accountId: ACCOUNT,
+      event: disputeEvent(
+        'charge.dispute.closed',
+        dispute({ status: 'warning_closed' }),
+      ),
+    })
+
+    // Not won and not lost: recorded, but nothing to post.
+    expect(fact.factType).toBe('dispute_closed')
+  })
+
+  it('gives won and lost different dedupe keys', () => {
+    const [won] = factsFromEvent({
+      accountId: ACCOUNT,
+      event: disputeEvent('charge.dispute.closed', dispute({ status: 'won' })),
+    })
+    const [lost] = factsFromEvent({
+      accountId: ACCOUNT,
+      event: disputeEvent('charge.dispute.closed', dispute({ status: 'lost' })),
+    })
+
+    expect(won.dedupeKey).not.toBe(lost.dedupeKey)
   })
 })

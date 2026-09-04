@@ -363,32 +363,37 @@ model oauth_providers {
 // schema.prisma
 
 model store {
-  name                String
-  slug                String                 @unique
-  customDomain        String?                @unique
-  logo                String?
-  currency            String                 @default("USD")
-  ownerId             BigInt
-  createdAt           DateTime               @default(now())
-  updatedAt           DateTime
-  status              BigInt                 @default(1)
-  id                  BigInt                 @id @default(autoincrement())
-  description         String?
-  menus               StoreMenu[]
-  pages               StorePage[]
-  theme               StoreTheme?
-  sections            ThemeSection[]
-  products            Product[]
-  productTypes        ProductType[]
-  tags                Tag[]
-  collections         Collection[]
-  orders              Order[]
+  name         String
+  slug         String           @unique
+  customDomain String?          @unique
+  logo         String?
+  currency     String           @default("USD")
+  ownerId      BigInt
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime
+  status       BigInt           @default(1)
+  id           BigInt           @id @default(autoincrement())
+  description  String?
+  /// At most one row per ownerId may have is_default = true — enforced by a
+  /// PostgreSQL partial unique index (see migration
+  /// 20260820120000_add_store_default), not by this boolean alone.
+  is_default   Boolean          @default(false)
+  menus        StoreMenu[]
+  pages        StorePage[]
+  theme        StoreTheme?
+  sections     ThemeSection[]
+  products     Product[]
+  productTypes ProductType[]
+  tags         Tag[]
+  collections  Collection[]
+  orders       Order[]
   /// وضع الدفع النشط. عمود واحد، فالتنافي مضمون بالبناء: مستحيل
   /// المتجر يكون في وضعين.
-  payment_mode        StorePaymentMode @default(MERCHANT_GATEWAY)
+  payment_mode StorePaymentMode @default(MERCHANT_GATEWAY)
 
-  paymentAccounts     PaymentAccount[]
-  checkouts           Checkout[]
+  paymentAccounts PaymentAccount[]
+  checkouts       Checkout[]
+  carts           Cart[]
 
   users users @relation(fields: [ownerId], references: [id])
 }
@@ -862,6 +867,9 @@ enum PaymentMethodKey {
   benefit
   apple_pay
   google_pay
+  /// محفظة STC Pay — طريقة دفع سعودية برقم الجوال + OTP. مدعومة من
+  /// نموذج ميسر المضمّن نفسه (`stcpay`)، مش سطح دفع منفصل.
+  stc_pay
   wallet
   kiosk
   bank_transfer
@@ -1016,7 +1024,7 @@ model PaymentAccount {
   ///
   /// ⚠️ **مابترجعش أبداً في أي رد API.** الواجهة بتاخد تلميح مقنّع
   /// (credentials_hint) و is_configured بس.
-  credentials_envelope String?
+  credentials_envelope   String?
   credential_kek_version Int?
   credential_dek_version Int?
 
@@ -1047,7 +1055,6 @@ model PaymentAccount {
   @@index([store_id, mode, status])
   @@map("payment_accounts")
 }
-
 
 // ═══════════════════════════════════════════════════════════════════
 // Phase 1a — Foundations
@@ -1156,11 +1163,11 @@ model OutboxMessage {
   status OutboxStatus @default(pending)
 
   /// حجز للتوزيع — بيخلي أكتر من instance تشتغل بأمان من غير Redis
-  claimed_by        String?   @db.VarChar(100)
-  claim_expires_at  DateTime? @db.Timestamptz(6)
+  claimed_by       String?   @db.VarChar(100)
+  claim_expires_at DateTime? @db.Timestamptz(6)
 
-  attempts        Int       @default(0)
-  next_attempt_at DateTime  @default(now()) @db.Timestamptz(6)
+  attempts        Int      @default(0)
+  next_attempt_at DateTime @default(now()) @db.Timestamptz(6)
   last_error      String?
 
   /// وقت حدوث الحدث في العمل (مقابل وقت تسجيله في النظام)
@@ -1220,6 +1227,18 @@ enum CheckoutStatus {
   expired
   abandoned
   failed
+}
+
+/// حالة السلة. `converted` و`abandoned` نهائيتان: السلة اللي وصلتلهم
+/// مابترجعش `active` أبداً — العميل بياخد سلة جديدة بدل ما القديمة
+/// تُحيا.
+enum CartStatus {
+  /// سلة العميل الحيّة
+  active
+  /// اتحوّلت لطلب — نهائية
+  converted
+  /// انتهت صلاحيتها أو اتفضّت صراحةً — نهائية
+  abandoned
 }
 
 enum QuoteComponentKind {
@@ -1339,6 +1358,84 @@ enum PaymentEventSource {
   system
 }
 
+/// سلة الشراء — هوية الشراء نفسه، مش مجرد قايمة منتجات.
+///
+/// السؤال اللي الجدول ده بيرد عليه: "التابين دول بيشتروا نفس الشراء
+/// ولا اتنين شراء مختلفين؟". الرد بيجي من صف واحد مشترك بين التابين
+/// عن طريق كوكي، مش من مقارنة محتويات السلة — فعميل بيشتري نفس
+/// المنتجات مرتين ورا بعض بياخد سلتين وطلبين، وده تصرف سليم.
+///
+/// مافيش فلوس هنا إطلاقاً: التسعير بيحصل في الـ checkout من صفوف
+/// المنتجات على السيرفر، زي ما هو دلوقتي بالظبط.
+model Cart {
+  id BigInt @id @default(autoincrement())
+
+  store_id BigInt
+  store    store  @relation(fields: [store_id], references: [id], onDelete: Cascade)
+  mode     Mode
+
+  /// السر اللي في الكوكي. مابيظهرش في أي رد ولا في أي URL.
+  token String @unique @db.VarChar(64)
+
+  /// معرّف علني غير سري — بيتبعت للمتصفح عشان الـ logs والـ debugging،
+  /// ومابينفعش يقرا ولا يعدّل سلة.
+  public_id String @unique @db.VarChar(32)
+
+  status CartStatus @default(active)
+
+  /// الشيك أوت الحيّ الوحيد لهذه السلة. NULL يعني مفيش.
+  /// ده العمود اللي بيمنع تابين من إنشاء شيك أوتين.
+  ///
+  /// عمود عادي من غير relation، زي `checkouts.order_id` و
+  /// `checkouts.supersedes_id`: نفس نمط البحث، ومفيش referential action
+  /// جديد بيتداخل مع الـ cascade على مستوى المتجر.
+  active_checkout_id BigInt?
+
+  /// إيجار مؤقت أثناء إنشاء شيك أوت (المكالمة مع البوابة برة الـ
+  /// transaction). نفس فكرة locked_until في payment_idempotency_records:
+  /// عملية بتموت في نص الطريق بتسيب السلة تفك لوحدها بدل ما تتقفل ٣٠ يوم.
+  claimed_until DateTime? @db.Timestamptz(6)
+
+  /// بيزيد مع كل تعديل. المتصفح بيستخدمه عشان يعرف إن نسخته قديمة.
+  version Int @default(0)
+
+  /// الطلب اللي السلة اتحوّلت له. هوية فقط، مش حالة دفع.
+  converted_order_id BigInt?
+  converted_at       DateTime? @db.Timestamptz(6)
+
+  expires_at DateTime @db.Timestamptz(6)
+
+  items CartItem[]
+
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([store_id, mode, status])
+  @@index([expires_at])
+  @@map("carts")
+}
+
+/// صف منتج في السلة.
+///
+/// مفيش سعر ولا عنوان ولا صورة — كلها بتتقرا من ProductVariant وقت
+/// التسعير، فالمتصفح مابيقدرش يأثر على مبلغ.
+model CartItem {
+  id BigInt @id @default(autoincrement())
+
+  cart_id BigInt
+  cart    Cart   @relation(fields: [cart_id], references: [id], onDelete: Cascade)
+
+  variant_id BigInt
+  quantity   Int
+
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([cart_id, variant_id])
+  @@index([cart_id])
+  @@map("cart_items")
+}
+
 /// سلة مجمّدة + عنوان + سعر، قبل ما تتحوّل لطلب.
 ///
 /// الـ checkout بياخد token معتّم مش رقم تسلسلي: أرقام الطلبات
@@ -1379,6 +1476,30 @@ model Checkout {
   /// الطلب اللي اتولد من الالتزام
   order_id BigInt? @unique
 
+  /// الشيك أوت اللي ده اتعمل بديلاً له — إعادة محاولة أو تغيير وسيلة دفع.
+  ///
+  /// هوية فقط: مافيش هنا حالة دفع ولا مبلغ ولا رقم طلب ولا أي سر. بتتكتب
+  /// مرة واحدة وقت إنشاء الصف الجديد (INSERT) ومابتتعدّلش بعد كده، فمافيش
+  /// تعديل على صف اتقفل خلاص ولا سباق بين تابين.
+  ///
+  /// موجودة عشان سؤال واحد: صفحة رجعت من الـ history بتحمل توكن قديم —
+  /// هل الشيك أوت ده اتاخد مكانه بواحد تاني؟ الخادم وحده اللي بيرد، وحالة
+  /// الخليفة نفسها بتتقرا من سجله هو، مش من المتصفح.
+  ///
+  /// عمود عادي من غير relation، زي `order_id` فوق بالظبط.
+  supersedes_id BigInt?
+
+  /// السلة اللي الشيك أوت ده اتولد منها.
+  ///
+  /// هوية فقط: مافيش هنا حالة ولا مبلغ ولا سر. بتتكتب مرة واحدة وقت
+  /// الـ INSERT ومابتتعدّلش، زي `supersedes_id` بالظبط. NULL للشيك
+  /// أوتات اللي اتعملت من غير كوكي سلة (المسار بدون حالة).
+  ///
+  /// السؤال اللي بترد عليه مختلف تماماً عن سؤال `supersedes_id`:
+  /// "السلة دي بتاعة مين؟" مقابل "المحاولة دي بديلة لإيه؟". عمودين،
+  /// سؤالين، مافيش تداخل.
+  cart_id BigInt?
+
   client_ip  String? @db.VarChar(64)
   user_agent String? @db.VarChar(400)
 
@@ -1392,6 +1513,12 @@ model Checkout {
   @@index([store_id, mode, status])
   @@index([expires_at])
   @@index([store_id, mode, created_at])
+  // الاستعلام العكسي: مين اللي اتعمل بديلاً للشيك أوت ده؟
+  @@index([supersedes_id])
+  // "الشيك أوتات بتاعة السلة دي" — والفهرس الجزئي الفريد اللي بيضمن
+  // شيك أوت حيّ واحد لكل سلة موجود في الـ migration (checkouts_one_live_per_cart)،
+  // لأن Prisma مالوش تعبير عن فهرس بشرط WHERE.
+  @@index([cart_id])
   @@map("checkouts")
 }
 
@@ -1468,6 +1595,12 @@ model InventoryReservation {
 
   @@unique([checkout_id, variant_id])
   @@index([state, expires_at])
+  // البحث العام عن حجوزات متغيّر معيّن. أما مجموع الوحدات المحجوزة
+  // «دلوقتي» — اللي بيتحسب في كل شيك أوت — فله فهرس جزئي على
+  // state = 'held' اسمه inventory_reservations_held_by_variant_idx،
+  // وهو موجود في الـ migration (20260903120000_inventory_concurrency_guards)
+  // لأن Prisma مالوش تعبير عن فهرس بشرط WHERE — نفس حالة
+  // checkouts_one_live_per_cart في Checkout.
   @@index([store_id, mode, variant_id])
   @@map("inventory_reservations")
 }
@@ -1521,11 +1654,31 @@ model PaymentIntent {
   expires_at  DateTime? @db.Timestamptz(6)
   terminal_at DateTime? @db.Timestamptz(6)
 
+  /// آخر مرة زارت فيها المصالحة هذه النية.
+  ///
+  /// The reconciliation sweep's progress marker. NULL means it has
+  /// never been visited, and those go first.
+  ///
+  /// Without it the sweep took the 50 OLDEST non-terminal intents every
+  /// run, and an intent that can never currently reconcile — a
+  /// manual-capture `authorized` waiting weeks for the merchant, an
+  /// attempt with no gateway reference, a provider with no status
+  /// polling — stayed the oldest forever. Fifty of those and the sweep
+  /// re-read the same fifty every five minutes and never saw a newer
+  /// one again, silently, because it only logs when it processes
+  /// something.
+  ///
+  /// Stamped on EVERY visit, not only successful ones, so an intent
+  /// that cannot be processed still moves to the back of the queue and
+  /// is retried later rather than never or forever.
+  last_reconciled_at DateTime? @db.Timestamptz(6)
+
   metadata Json?
 
   attempts PaymentAttempt[]
   captures Capture[]
   refunds  Refund[]
+  disputes Dispute[]
   events   PaymentEvent[]
 
   created_at DateTime @default(now()) @db.Timestamptz(6)
@@ -1536,6 +1689,9 @@ model PaymentIntent {
   @@index([context_kind, context_id])
   @@index([status, expires_at])
   @@index([store_id, mode, created_at])
+  /// The reconciliation sweep's own access path: eligible rows ordered
+  /// by how long ago they were last visited.
+  @@index([status, last_reconciled_at])
   @@map("payment_intents")
 }
 
@@ -1560,8 +1716,8 @@ model PaymentAttempt {
 
   status PaymentAttemptStatus @default(initialized)
 
-  authorized_amount_minor   BigInt?
-  authorization_expires_at  DateTime? @db.Timestamptz(6)
+  authorized_amount_minor  BigInt?
+  authorization_expires_at DateTime? @db.Timestamptz(6)
 
   /// معرّفات البوابة — التفرّد على مستوى الحساب مش البوابة، عشان
   /// متجرين بنفس حساب البوابة مايتعارضوش
@@ -1616,6 +1772,7 @@ model Capture {
 
   allocations CaptureAllocation[]
   refunds     Refund[]
+  disputes    Dispute[]
 
   created_at DateTime @default(now()) @db.Timestamptz(6)
   updated_at DateTime @updatedAt @db.Timestamptz(6)
@@ -1669,7 +1826,7 @@ model Refund {
   amount_minor BigInt
   currency     String @db.VarChar(3)
 
-  status    RefundStatus    @default(pending)
+  status       RefundStatus    @default(pending)
   initiated_by RefundInitiator @default(merchant)
 
   reason String? @db.VarChar(400)
@@ -1847,4 +2004,117 @@ model PaymentEvent {
   @@index([intent_id, recorded_at])
   @@index([store_id, mode, event_type])
   @@map("payment_events")
+}
+
+/// حالة النزاع.
+///
+/// ثلاث حالات بس: النزاع بيتفتح، وبعدين بيتكسب أو بيتخسر. أي حالة
+/// وسيطة عند المزوّد (تحذير، تحت المراجعة) بتتسجّل كحدث في
+/// payment_events من غير ما تحرّك الدفتر.
+enum DisputeStatus {
+  open
+  won
+  lost
+}
+
+/// نزاع (chargeback) على دفعة.
+///
+/// شقيق Refund في شجرة دورة الحياة (راجع docs/PAYMENTS-ARCHITECTURE.md):
+/// الاتنين بيتعلّقوا بالنية، والاتنين بيتولدوا من حقائق البوابة مش من
+/// كتابة مباشرة.
+model Dispute {
+  id BigInt @id @default(autoincrement())
+
+  intent_id BigInt
+  intent    PaymentIntent @relation(fields: [intent_id], references: [id], onDelete: Cascade)
+
+  /// null لو البوابة بلّغت عن نزاع من غير ما تحدّد التحصيل
+  capture_id BigInt?
+  capture    Capture? @relation(fields: [capture_id], references: [id], onDelete: SetNull)
+
+  store_id BigInt
+  mode     Mode
+
+  amount_minor BigInt
+  currency     String @db.VarChar(3)
+
+  status DisputeStatus @default(open)
+
+  reason String? @db.VarChar(120)
+
+  gateway_dispute_ref String? @db.VarChar(255)
+
+  opened_at   DateTime  @db.Timestamptz(6)
+  resolved_at DateTime? @db.Timestamptz(6)
+
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @updatedAt @db.Timestamptz(6)
+
+  /// نفس نمط Refund: مرجع البوابة فريد لكل متجر، فإعادة إرسال نفس
+  /// النزاع مابتعملش صف تاني.
+  @@unique([store_id, gateway_dispute_ref])
+  @@index([intent_id, status])
+  @@index([store_id, mode, status])
+  @@map("disputes")
+}
+
+/// سجل دائم لكل نداء ويبهوك وصل، قبل ما يتفسّر.
+///
+/// ⚠️ جدول **منصّة** مش جدول مستأجر: الويبهوك بيوصل ومعاه معرّف حساب
+/// بس، فالمتجر لسه مش معروف وقت الكتابة. عشان كده الكتابة بتتم على
+/// اتصال platform() زي ما بيحصل في حل الحساب نفسه، و store_id/mode
+/// أعمدة تدقيق بتتملّى بعد الحل مش حدود صلاحيات.
+///
+/// ⚠️ الجسم الخام **مابيتخزّنش**. بيانات الويبهوك فيها بيانات عملاء،
+/// فالمخزّن هو بصمة sha256 (بتثبت إيه اللي وصل) + نسخة منقّاة، نفس
+/// سياسة payload_redacted في payment_events.
+model WebhookEvent {
+  id BigInt @id @default(autoincrement())
+
+  /// البوابة زي ما جات في المسار — متحقّق إنها تطابق بوابة الحساب
+  gateway String @db.VarChar(40)
+
+  /// معرّف حساب الدفع من المسار.
+  ///
+  /// مش مفتاح أجنبي عن قصد: السجل لازم يفضل موجود حتى لو الحساب
+  /// اتحذف بعدين، وإلا بيضيع أثر التدقيق مع أول تنظيف.
+  account_id BigInt
+
+  /// بيتملّوا من الحساب بعد ما يتحل.
+  store_id BigInt?
+  mode     Mode?
+
+  /// معرّف الحدث عند المزوّد.
+  ///
+  /// null قبل التحقق من التوقيع: القيمة دي جوه الجسم الموقّع، وقراءتها
+  /// قبل ما التوقيع يعدّي معناها الثقة في مدخل مش موثوق.
+  provider_event_id String? @db.VarChar(255)
+  event_type        String? @db.VarChar(100)
+
+  /// نص مش enum: التصنيف بيكبر مع كل بوابة جديدة، زي entry_type.
+  status String @db.VarChar(40)
+
+  signature_verified Boolean @default(false)
+
+  /// كود مصنّف، مش نص الاستثناء — عشان مايتسربش أي سر في اللوج.
+  failure_code String? @db.VarChar(60)
+
+  /// بصمة الجسم الخام وطوله. بيثبتوا اللي وصل من غير تخزين بيانات العميل.
+  body_sha256 String @db.VarChar(64)
+  body_bytes  Int
+
+  payload_redacted Json?
+
+  fact_count Int @default(0)
+
+  received_at  DateTime  @default(now()) @db.Timestamptz(6)
+  processed_at DateTime? @db.Timestamptz(6)
+
+  /// ضمانة عدم التكرار على مستوى قاعدة البيانات: نفس الحدث من نفس
+  /// الحساب مرة واحدة. Postgres بيعتبر كل NULL مختلف، فالصفوف اللي
+  /// لسه ماوصلتش لمعرّف حدث (رفض توقيع مثلاً) مابتتعارضش.
+  @@unique([account_id, provider_event_id])
+  @@index([account_id, received_at])
+  @@index([status, received_at])
+  @@map("webhook_events")
 }

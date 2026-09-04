@@ -3,6 +3,7 @@ import {
   Get,
   Post,
   Put,
+  Patch,
   Delete,
   Body,
   Param,
@@ -244,6 +245,18 @@ async reorderThemeSections(@ActiveStore() store: StoreRecord, @Body() body: Reor
 // ) {
 //   return this.storeService.getPublicStoreProducts(slug, parseInt(limit))
 // }
+
+  // =====================
+  // DEFAULT STORE
+  // =====================
+  // Ownership comes exclusively from req.user.id (SessionAuthGuard) plus a
+  // server-side lookup scoped to that id — the body is never trusted for
+  // ownerId/userId, matching the same pattern as updateStore() below and
+  // ActiveStoreService elsewhere in this module.
+  @Patch(':slug/default')
+  async setDefault(@Request() req, @Param('slug') slug: string) {
+    return this.storeService.setDefaultStore(req.user.id, slug)
+  }
 
   @Post(':slug')
 async update(@Request() req, @Param('slug') slug: string, @Body() body: any) {

@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient, Prisma } from '@prisma/client'
 import {
   IdReservationError,
   IdReservationService,
@@ -125,22 +125,59 @@ describe('IdReservationService (integration)', () => {
   it('produces ids usable as explicit primary keys', async () => {
     const id = await service.reserve(TEST_KEY)
 
-    await prisma.outboxMessage.create({
-      data: {
-        id,
-        store_id: 1n,
-        mode: 'live',
-        aggregate_type: 'spec',
-        aggregate_id: '1',
-        event_type: 'spec.event',
-        payload: {},
-        occurred_at: new Date(),
-      },
-    })
+    // outbox_messages is RLS-enabled (test/global-setup.ts): the raw
+    // rls_test client this spec holds can only write it once
+    // app.store_id/app.mode are installed on the same transaction —
+    // the same tenant-context pattern already used in every other
+    // integration spec this stage. IdReservationService itself never
+    // touches this table's rows (it only calls nextval() on the
+    // underlying sequence, which RLS does not apply to); this is a
+    // fixture-only requirement for proving the reserved id round-trips
+    // as a real primary key, not a defect in the service under test.
+    await withTenant(1n, 'live', (tx) =>
+      tx.outboxMessage.create({
+        data: {
+          id,
+          store_id: 1n,
+          mode: 'live',
+          aggregate_type: 'spec',
+          aggregate_id: '1',
+          event_type: 'spec.event',
+          payload: {},
+          occurred_at: new Date(),
+        },
+      }),
+    )
 
-    const found = await prisma.outboxMessage.findFirst({
-      where: { id, store_id: 1n, mode: 'live' },
-    })
+    const found = await withTenant(1n, 'live', (tx) =>
+      tx.outboxMessage.findFirst({
+        where: { id, store_id: 1n, mode: 'live' },
+      }),
+    )
     expect(found?.id).toBe(id)
   })
+
+  /**
+   * See the doc comment on the one call site above for why this is
+   * needed. Matches the pattern already used in
+   * order.service.integration.spec.ts,
+   * payment-collection.service.integration.spec.ts,
+   * refunds.integration.spec.ts, outbox-dispatcher.integration.spec.ts,
+   * payment-notification.integration.spec.ts, and
+   * ledger.service.integration.spec.ts.
+   */
+  async function withTenant<T>(
+    storeId: bigint,
+    mode: string,
+    cb: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    return prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        SELECT
+          set_config('app.store_id', ${storeId.toString()}, true),
+          set_config('app.mode', ${mode}, true)
+      `
+      return cb(tx as Prisma.TransactionClient)
+    })
+  }
 })

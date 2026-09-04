@@ -73,7 +73,7 @@ function build(over: {
 }
 
 describe('registration', () => {
-  it('registers for exactly the four payment events', () => {
+  it('registers for exactly the events it can phrase', () => {
     const { consumer, registered } = build()
     consumer.onModuleInit()
 
@@ -82,6 +82,9 @@ describe('registration', () => {
       'payment.collected',
       'order.cancelled',
       'payment.refunded',
+      // Round 9: not a payment event, but the same kind of thing —
+      // something the merchant has to act on.
+      'inventory.oversold',
     ])
   })
 

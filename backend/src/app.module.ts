@@ -14,6 +14,7 @@ import { ProductModule } from './stores/products/product.module'
 import { OrderModule } from './stores/orders/order.module'
 import { CollectionsModule } from './stores/collections/collections.module'
 import { PaymentsModule } from './stores/payments/payments.module'
+import { CartModule } from './stores/cart/cart.module'
 import { CheckoutModule } from './stores/checkout/checkout.module'
 import { UploadsModule } from './uploads/uploads.module'
 import { ActiveStoreModule } from './stores/active-store.module'
@@ -64,6 +65,11 @@ import { ThrottlerModule } from '@nestjs/throttler'
     // NestJS matches routes in module registration order. This keeps
     // POST 'storefront/:slug/checkout' ahead of the existing dynamic
     // 'storefront/:slug/orders/:orderNumber' route.
+    //
+    // CartModule goes first for the same reason: its routes are
+    // 'storefront/:slug/cart...', which must be matched before
+    // OrderModule's dynamic 'storefront/:slug/orders/:orderNumber'.
+    CartModule,
     CheckoutModule,
 
     OrderModule,

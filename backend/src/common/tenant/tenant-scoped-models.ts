@@ -33,6 +33,12 @@ export interface TenantScopedModel {
    * الافتراضي 'store'.
    */
   readonly storeRelation?: string;
+
+  /**
+   * Exact unique lookup fields that may make mode unnecessary.
+   * Store scope remains mandatory.
+   */
+  readonly modeOptionalUniqueFields?: readonly string[];
 }
 
 export const TENANT_SCOPED_MODELS: readonly TenantScopedModel[] = [
@@ -50,7 +56,24 @@ export const TENANT_SCOPED_MODELS: readonly TenantScopedModel[] = [
   { model: 'PaymentMethodOffering', storeField: 'store_id', modeField: 'mode' },
 
   // ── الـ checkout (المرحلة 1b.2) ────────────────────────────────
-  { model: 'Checkout', storeField: 'store_id', modeField: 'mode' },
+  {
+    model: 'Checkout',
+    storeField: 'store_id',
+    modeField: 'mode',
+    modeOptionalUniqueFields: ['token'],
+  },
+
+  // ── سلة المتجر (الجولة 8) ──────────────────────────────────────
+  //
+  // السلة بتتقري بالـ token اللي جاي من الكوكي وبالـ public_id، والاتنين
+  // فريدين على مستوى المنصة كلها — زي `Checkout.token` بالظبط — فالـ
+  // mode مش شرط في اللوكاب ده. نطاق المتجر بيفضل إجباري.
+  {
+    model: 'Cart',
+    storeField: 'store_id',
+    modeField: 'mode',
+    modeOptionalUniqueFields: ['token', 'public_id'],
+  },
   { model: 'InventoryReservation', storeField: 'store_id', modeField: 'mode' },
 
   // ── الدفع (المرحلة 1b.2) ───────────────────────────────────────
@@ -63,6 +86,9 @@ export const TENANT_SCOPED_MODELS: readonly TenantScopedModel[] = [
   // ── الاسترداد ──────────────────────────────────────────────────
   { model: 'Refund', storeField: 'store_id', modeField: 'mode' },
   { model: 'RefundAllocation', storeField: 'store_id', modeField: 'mode' },
+
+  // ── النزاعات ───────────────────────────────────────────────────
+  { model: 'Dispute', storeField: 'store_id', modeField: 'mode' },
 
   // ── الدفتر ─────────────────────────────────────────────────────
   { model: 'Beneficiary', storeField: 'store_id', modeField: 'mode' },
@@ -118,8 +144,24 @@ export const DELIBERATELY_UNSCOPED: readonly {
     reason: 'مالوش store_id — مربوط بالـ checkout اللي بيملكه',
   },
   {
+    model: 'CartItem',
+    reason:
+      'مالوش store_id عن قصد — مابيتوصلّهوش غير من خلال السلة اللي ' +
+      'بتملكه، وسياسة الـ RLS بتقول ده حرفياً (EXISTS على carts بالمتجر ' +
+      'والوضع)، زي OrderItem مع Order بالظبط. مسجّل هنا صراحةً عشان ' +
+      'الغياب يبان قرار مش سهو.',
+  },
+  {
     model: 'LedgerPosting',
     reason: 'مالوش store_id — مربوط بالقيد اللي بيملكه',
+  },
+  {
+    model: 'WebhookEvent',
+    reason:
+      'جدول منصّة: الويبهوك بيتكتب قبل ما المتجر يبقى معروف أصلاً، ' +
+      'فالكتابة على اتصال platform() و store_id عمود تدقيق بيتملّى بعد ' +
+      'حل الحساب — مش حد صلاحيات. لو اتسجّل هنا الحارس هيبلّغ عن كل ' +
+      'كتابة سليمة قبل الحل.',
   },
 ];
 

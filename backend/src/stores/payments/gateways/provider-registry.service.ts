@@ -3,13 +3,18 @@ import type { PaymentMethodKey } from '@prisma/client'
 import {
   IPaymentProvider,
   PAYMENT_PROVIDERS,
+  outboundIdempotencyKey,
 } from './payment-provider.interface'
 import {
   ProviderError,
+  capabilityContradictions,
   supportsCurrency,
   supportsMethod,
   type GatewayCapabilities,
+  type PaymentOperation,
 } from './provider.types'
+import { listGateways } from '../gateway-catalog'
+import { checkGatewayParity, type ParityReport } from './gateway-parity'
 
 /** Capability flags that require a matching optional method. */
 const CAPABILITY_METHODS: ReadonlyArray<{
@@ -19,8 +24,15 @@ const CAPABILITY_METHODS: ReadonlyArray<{
   { flag: 'webhooks', method: 'parseWebhook' },
   { flag: 'manualCapture', method: 'capture' },
   { flag: 'voidSupported', method: 'voidAuthorization' },
-  { flag: 'partialRefund', method: 'refund' },
+  { flag: 'refundSupported', method: 'refund' },
 ]
+
+/** Methods a resolution strategy cannot work without. */
+const RESOLUTION_METHODS: Readonly<
+  Partial<Record<GatewayCapabilities['webhookResolution'], keyof IPaymentProvider>>
+> = {
+  payload_scoped: 'extractWebhookAccountRef',
+}
 
 /**
  * ==================================================================
@@ -35,6 +47,12 @@ const CAPABILITY_METHODS: ReadonlyArray<{
  * On boot it checks that every declared capability has the method
  * backing it. A capability matrix nobody enforces becomes a lie, and the
  * lie is only discovered when a customer's payment fails.
+ *
+ * Agreement with the *catalog* is reported here (`parity()`) but
+ * enforced by `GatewayParityCheck`, which runs over the real catalog at
+ * application boot. Keeping the two apart is what lets a test register a
+ * synthetic adapter — the registry's own invariants do not depend on a
+ * gateway being one a merchant can buy.
  */
 @Injectable()
 export class ProviderRegistry implements OnModuleInit {
@@ -60,6 +78,20 @@ export class ProviderRegistry implements OnModuleInit {
     this.logger.log(
       `Payment adapters registered: ${[...this.byGateway.keys()].sort().join(', ') || 'none'}`,
     )
+  }
+
+  /**
+   * How the catalog and the registered adapters disagree.
+   *
+   * Exposed as well as enforced so a diagnostic endpoint or a test can
+   * read the same report the boot check acts on, rather than a second
+   * comparison written by hand.
+   */
+  parity(): ParityReport {
+    return checkGatewayParity({
+      catalog: listGateways(),
+      adapters: [...this.byGateway.values()].map((p) => p.capabilities),
+    })
   }
 
   /** Adapter for a gateway, or a configuration error. */
@@ -120,6 +152,26 @@ export class ProviderRegistry implements OnModuleInit {
     return provider
   }
 
+  /**
+   * The idempotency key to send outbound for one operation.
+   *
+   * Core always derives the key — deterministically, from the intent and
+   * attempt — and this is only where an adapter may *reshape* it to fit a
+   * provider's length or character rules. There is no second idempotency
+   * system: the base is the same value recorded on the attempt, and
+   * `IdempotencyService` still governs the inbound request.
+   */
+  outboundIdempotencyKey(input: {
+    gateway: string
+    base: string
+    operation: PaymentOperation
+  }): string {
+    return outboundIdempotencyKey(this.get(input.gateway), {
+      base: input.base,
+      operation: input.operation,
+    })
+  }
+
   /** Wire-format exponent for an amount, where the provider overrides ISO. */
   exponentOverride(gateway: string, currency: string): number | null {
     const overrides = this.capabilities(gateway).exponentOverrides
@@ -139,16 +191,33 @@ export class ProviderRegistry implements OnModuleInit {
       }
     }
 
-    if (capabilities.methods.length === 0) {
+    // A resolution strategy is also a claim about code that must exist:
+    // payload-scoped routing without an extractor would leave ingestion
+    // with no way to find the account, and the failure would only appear
+    // on the first live callback.
+    const required = RESOLUTION_METHODS[capabilities.webhookResolution]
+
+    if (
+      capabilities.webhooks &&
+      required &&
+      typeof provider[required] !== 'function'
+    ) {
       throw new Error(
-        `Adapter "${capabilities.gateway}" declares no supported methods.`,
+        `Adapter "${capabilities.gateway}" declares ${capabilities.webhookResolution} ` +
+          `webhook resolution but does not implement ${String(required)}().`,
       )
     }
 
-    if (capabilities.webhooks && capabilities.webhookResolution === 'none') {
+    // Everything a descriptor can contradict on its own, checked in one
+    // place so the rules do not fork between boot and the conformance
+    // suite.
+    const contradictions = capabilityContradictions(capabilities)
+
+    if (contradictions.length > 0) {
       throw new Error(
-        `Adapter "${capabilities.gateway}" declares webhooks but no resolution strategy.`,
+        `Adapter "${capabilities.gateway}" ${contradictions.join('; ')}.`,
       )
     }
   }
+
 }

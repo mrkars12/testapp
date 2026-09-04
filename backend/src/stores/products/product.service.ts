@@ -1,11 +1,74 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  Optional,
+  BadRequestException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
-import { ProductStatus } from '@prisma/client';
+import { Prisma, ProductStatus } from '@prisma/client';
+import type { Mode } from '@prisma/client';
+import type { AppConfig } from '../../common/config/configuration';
+import {
+  assertAbsoluteEditIsSafe,
+  lockVariants,
+} from '../inventory/inventory-claim';
 import type { store as StoreRecord } from '@prisma/client';
+
+/**
+ * Refuses a variant that would be left owing stock it is no longer
+ * allowed to owe.
+ *
+ * A negative `inventory_qty` is legitimate — it is how a backorder
+ * records units already sold and not yet on the shelf — but ONLY while
+ * `continue_selling` is true. Turning backorder off on a variant that
+ * is eleven units in deficit is not a coherent instruction: the
+ * merchant is saying "stop selling past zero" about a variant that is
+ * already past zero.
+ *
+ * The database refuses this too, via the CHECK constraint
+ * `product_variant_inventory_floor`. This exists so the merchant reads
+ * a sentence instead of a Postgres constraint violation, and so the
+ * refusal happens before anything else in the update is written.
+ */
+function assertInventoryFloor(input: {
+  inventoryQty: number;
+  continueSelling: boolean;
+  title: string;
+}): void {
+  if (input.continueSelling || input.inventoryQty >= 0) return;
+
+  throw new BadRequestException(
+    `"${input.title}" has an outstanding backorder of ` +
+      `${Math.abs(input.inventoryQty)} unit(s). Resolve the deficit by ` +
+      'setting its stock to zero or more before turning off ' +
+      '"continue selling when out of stock".',
+  );
+}
 
 @Injectable()
 export class ProductService {
-  constructor(private prisma: PrismaService) {}
+  /**
+   * `config` is optional so the many `new ProductService(prisma)` call
+   * sites in the specs keep working, exactly as `OrderService` and
+   * `CheckoutService` treat their own optional collaborators.
+   */
+  constructor(
+    private prisma: PrismaService,
+    @Optional() private readonly config?: ConfigService,
+  ) {}
+
+  /**
+   * The payment mode this store's storefront runs in.
+   *
+   * Used only to install a well-formed tenant context: it decides which
+   * `inventory_reservations` rows the R6 hold guard can see, and must
+   * therefore match the mode the storefront takes its holds in. See
+   * `heldQuantities()` in inventory-claim.ts for the rule.
+   */
+  private get storefrontMode(): Mode {
+    return this.config?.get<AppConfig>('app')?.storefrontPaymentMode ?? 'live';
+  }
 
   private jsonSafe(data: any) {
     return JSON.parse(
@@ -289,6 +352,49 @@ export class ProductService {
     });
   }
 
+  private validatePricing(data: any, hasOptions: boolean) {
+    const isValidPositive = (v: any) => {
+      if (v === null || v === undefined) return false;
+      const s = String(v).trim();
+      if (s === '') return false;
+      const n = parseFloat(s);
+      return !isNaN(n) && n > 0;
+    };
+    if (!hasOptions) {
+      const hasOriginal = data.compare_at_price !== undefined && data.compare_at_price !== null && String(data.compare_at_price).trim() !== '';
+      const hasSale = data.price !== undefined && data.price !== null && String(data.price).trim() !== '';
+      if (!hasOriginal) {
+        throw new BadRequestException('من فضلك أدخل السعر الأصلي قبل الخصم');
+      }
+      if (!isValidPositive(String(data.compare_at_price))) {
+        throw new BadRequestException('السعر الأصلي غير صحيح');
+      }
+      if (hasSale) {
+        if (!isValidPositive(String(data.price))) throw new BadRequestException('سعر البيع غير صحيح');
+        if (parseFloat(String(data.price)) > parseFloat(String(data.compare_at_price))) {
+          throw new BadRequestException('سعر البيع يجب أن يكون أقل من أو يساوي السعر الأصلي');
+        }
+      }
+    } else {
+      if (!Array.isArray(data.variants) || data.variants.length === 0) {
+        throw new BadRequestException('من فضلك أدخل أسعار الفاريانت');
+      }
+      for (const v of data.variants) {
+        const salePrice = v.compare_at_price;
+        const price = v.price;
+        if (!isValidPositive(salePrice)) {
+          throw new BadRequestException('من فضلك أدخل السعر الأصلي قبل الخصم لكل فاريانت');
+        }
+        if (price !== null && price !== undefined && String(price).trim() !== '') {
+          if (!isValidPositive(String(price))) throw new BadRequestException('سعر البيع غير صحيح للفاريانت');
+          if (parseFloat(String(price)) > parseFloat(String(salePrice))) {
+            throw new BadRequestException('سعر البيع يجب أن يكون أقل من أو يساوي السعر الأصلي للفاريانت');
+          }
+        }
+      }
+    }
+  }
+
   async createProduct(store: StoreRecord, data: any) {
     const hasPrice =
       data.price !== undefined &&
@@ -305,6 +411,7 @@ export class ProductService {
     );
 
     const hasOptions = effectiveOptions.length > 0;
+    this.validatePricing(data, hasOptions);
 
     const productTypeId =
       data.product_type_id !== undefined &&
@@ -447,7 +554,23 @@ export class ProductService {
           // الفرونت بعت variants كاملة جاهزة.
           for (let i = 0; i < data.variants.length; i++) {
             const v = data.variants[i];
-            const vPrice = parseFloat(v.price ?? '0');
+
+            const assertedQty =
+              parseInt(v.inventory_qty ?? v.quantity ?? '0') || 0;
+            const assertedContinueSelling =
+              v.continue_selling !== undefined
+                ? v.continue_selling === true
+                : data.continue_selling === true;
+            const assertedTitle =
+              v.title ||
+              (Array.isArray(v.combination) ? v.combination.join(' / ') : '') ||
+              'Default Title';
+
+            assertInventoryFloor({
+              inventoryQty: assertedQty,
+              continueSelling: assertedContinueSelling,
+              title: assertedTitle,
+            });
 
             await tx.productVariant.create({
               data: {
@@ -458,7 +581,10 @@ export class ProductService {
                     ? v.combination.join(' / ')
                     : '') ||
                   'Default Title',
-                price: isNaN(vPrice) ? 0 : vPrice,
+                price:
+                  v.price != null && String(v.price).trim() !== ''
+                    ? parseFloat(String(v.price))
+                    : null,
                 compare_at_price:
                   v.compare_at_price != null && v.compare_at_price !== ''
                     ? parseFloat(v.compare_at_price)
@@ -469,9 +595,10 @@ export class ProductService {
                     : null,
                 sku: v.sku || null,
                 barcode: v.barcode || null,
-                inventory_qty: parseInt(v.inventory_qty ?? '0') || 0,
-                track_inventory: true,
-                continue_selling: v.continue_selling === true,
+                inventory_qty: assertedQty,
+                // 5 & 6. Inventory tracked & Stop Selling must be persisted per variant (not hardcoded true)
+                track_inventory: v.track_inventory !== undefined ? v.track_inventory !== false : data.track_inventory !== false,
+                continue_selling: assertedContinueSelling,
                 option1: v.option1 ?? v.combination?.[0] ?? null,
                 option2: v.option2 ?? v.combination?.[1] ?? null,
                 option3: v.option3 ?? v.combination?.[2] ?? null,
@@ -482,6 +609,17 @@ export class ProductService {
             });
           }
         } else {
+          const singleQty = parseInt(
+            data.inventory_qty || data.quantity || '0',
+          );
+          const singleContinueSelling = data.continue_selling === true;
+
+          assertInventoryFloor({
+            inventoryQty: singleQty,
+            continueSelling: singleContinueSelling,
+            title: data.title ?? 'Default Title',
+          });
+
           await tx.productVariant.create({
             data: {
               product_id: product.id,
@@ -499,11 +637,9 @@ export class ProductService {
                   : null,
               sku: data.sku || null,
               barcode: data.barcode || null,
-              inventory_qty: parseInt(
-                data.inventory_qty || data.quantity || '0',
-              ),
+              inventory_qty: singleQty,
               track_inventory: data.track_inventory !== false,
-              continue_selling: data.continue_selling === true,
+              continue_selling: singleContinueSelling,
               option1: null,
               option2: null,
               option3: null,
@@ -613,6 +749,7 @@ export class ProductService {
     }
 
     const hasOptions = Array.isArray(data.options) && data.options.length > 0;
+    this.validatePricing(data, hasOptions);
 
     const productTypeId =
       data.product_type_id !== undefined &&
@@ -635,7 +772,34 @@ export class ProductService {
         )
       : [];
 
-    await this.prisma.guarded().$transaction(
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * A TENANT TRANSACTION, so the R6 hold guard can actually see the
+     * holds it is supposed to protect.
+     * ══════════════════════════════════════════════════════════════
+     *
+     * This was a plain `guarded().$transaction`, which installs no
+     * `app.store_id` / `app.mode` at all. Products and variants carry
+     * no RLS policy so nothing here appeared to need one — but
+     * `assertAbsoluteEditIsSafe()` below reads `inventory_reservations`,
+     * which IS RLS-scoped, and with the settings unset every policy
+     * expression evaluates to NULL and the table returns no rows.
+     *
+     * The guard therefore always summed ZERO held units and never
+     * refused anything. Round 9 §9's promise — "an absolute value below
+     * the units live checkouts are already holding is refused" — was
+     * inert in production, and its own test could not tell, because it
+     * asserted only that ONE of the edit and the claim wins, which is
+     * true whichever way the lock happens to fall.
+     *
+     * The mode is the storefront's own, for the reason set out in
+     * `inventory-claim.ts`: one variant has one physical pool, so every
+     * path that claims from it has to run in the same mode or the two
+     * halves net different sets of holds.
+     */
+    await this.prisma.withTenantTransaction(
+      store.id,
+      this.storefrontMode,
       async (tx) => {
         // -------------------------------------------------------------
         // Ownership validation
@@ -811,7 +975,7 @@ export class ProductService {
         // Sync variants
         // -------------------------------------------------------------
 
-        if (hasOptions && Array.isArray(data.variants)) {
+        if (Array.isArray(data.variants)) {
           const existingVariants = await tx.productVariant.findMany({
             where: {
               product_id: product.id,
@@ -820,6 +984,23 @@ export class ProductService {
 
           const existingVariantIds = new Set(
             existingVariants.map((variant) => variant.id.toString()),
+          );
+
+          /*
+           * ROUND 9 §8 R6 — SERIALISE THE EDIT AGAINST THE CLAIM.
+           *
+           * Locked here, once, for every variant this product owns,
+           * rather than per variant inside the loop: the ascending
+           * order is what keeps this path deadlock-free against a
+           * multi-line checkout claiming the same variants, and a loop
+           * would take them in payload order. Held until this
+           * transaction ends, so a concurrent checkout either claims
+           * before the edit or sees the edited number — never a torn
+           * read-modify-write across the two.
+           */
+          await lockVariants(
+            tx as unknown as Prisma.TransactionClient,
+            existingVariants.map((variant) => variant.id),
           );
 
           const incomingIds = new Set(
@@ -844,7 +1025,6 @@ export class ProductService {
 
           for (let i = 0; i < data.variants.length; i++) {
             const v = data.variants[i];
-            const vPrice = parseFloat(v.price ?? '0');
 
             const payload = {
               title:
@@ -854,7 +1034,10 @@ export class ProductService {
                   : '') ||
                 'Default Title',
 
-              price: isNaN(vPrice) ? 0 : vPrice,
+              price:
+                v.price != null && String(v.price).trim() !== ''
+                  ? parseFloat(String(v.price))
+                  : null,
 
               compare_at_price:
                 v.compare_at_price != null && v.compare_at_price !== ''
@@ -872,7 +1055,8 @@ export class ProductService {
               inventory_qty:
                 parseInt(v.inventory_qty ?? v.quantity ?? '0') || 0,
 
-              continue_selling: v.continue_selling === true,
+              track_inventory: v.track_inventory !== undefined ? v.track_inventory !== false : data.track_inventory !== false,
+              continue_selling: v.continue_selling !== undefined ? v.continue_selling === true : data.continue_selling === true,
 
               option1: v.option1 ?? v.combination?.[0] ?? null,
               option2: v.option2 ?? v.combination?.[1] ?? null,
@@ -884,6 +1068,12 @@ export class ProductService {
               position: i,
             };
 
+            assertInventoryFloor({
+              inventoryQty: payload.inventory_qty,
+              continueSelling: payload.continue_selling,
+              title: payload.title,
+            });
+
             if (v.id) {
               const variantId = BigInt(v.id);
 
@@ -894,6 +1084,14 @@ export class ProductService {
                   'Variant does not belong to this product',
                 );
               }
+
+              await assertAbsoluteEditIsSafe(tx as unknown as Prisma.TransactionClient, {
+                storeId: store.id,
+                variantId,
+                newQty: payload.inventory_qty,
+                continueSelling: payload.continue_selling,
+                title: payload.title,
+              });
 
               await tx.productVariant.update({
                 where: {
@@ -933,6 +1131,12 @@ export class ProductService {
             position: 0,
           };
 
+          assertInventoryFloor({
+            inventoryQty: payload.inventory_qty,
+            continueSelling: payload.continue_selling,
+            title: data.title ?? 'Default Title',
+          });
+
           if (data.price !== undefined) {
             const trimmed =
               data.price === null ? '' : String(data.price).trim();
@@ -971,6 +1175,21 @@ export class ProductService {
           });
 
           if (existing.length > 0) {
+            // Same R6 discipline on the single-variant path: lock
+            // first, refuse an edit that would strand a live hold.
+            await lockVariants(
+              tx as unknown as Prisma.TransactionClient,
+              existing.map((variant) => variant.id),
+            );
+
+            await assertAbsoluteEditIsSafe(tx as unknown as Prisma.TransactionClient, {
+              storeId: store.id,
+              variantId: existing[0].id,
+              newQty: payload.inventory_qty,
+              continueSelling: payload.continue_selling,
+              title: data.title ?? 'Default Title',
+            });
+
             await tx.productVariant.update({
               where: {
                 id: existing[0].id,

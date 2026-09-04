@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException, BadRequestException, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, BadRequestException, ConflictException, InternalServerErrorException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -10,6 +10,13 @@ import { randomUUID , randomBytes} from 'crypto'
 import axios from 'axios'
 import { RealtimeGateway } from '../realtime/realtime.gateway'
 import { ConfigService } from '@nestjs/config'
+import {
+  assertNotReservedSlug,
+  assertSupportedCurrency,
+  defaultStoreThemeData,
+  normalizeStoreSlug,
+} from '../stores/store-defaults'
+import { generateUniqueUsername } from './username.util'
 
 authenticator.options = {
 
@@ -44,11 +51,50 @@ authenticator.options = {
 
 
 
+  /**
+   * `/auth/me` (and anything else that surfaces the authenticated user to
+   * the client) must never leak the bcrypt hash, OTP/2FA secrets, or raw
+   * verification tokens — this was being sent to the frontend as-is via
+   * `req.user` (the full Prisma row set by the JWT guards) before this
+   * method existed. `has_password` is derived here rather than sending the
+   * hash's presence/absence implicitly, so the frontend's "does this
+   * account need to set a password" check (Part 10, social-account
+   * onboarding) doesn't need to reason about the hash at all.
+   */
+  sanitizeUser(user: any) {
+    if (!user) return null
+    return {
+      id: user.id?.toString?.() ?? user.id,
+      email: user.email,
+      username: user.username,
+      fullname: user.fullname,
+      country: user.country,
+      country_code: user.country_code,
+      mobile_code: user.mobile_code,
+      avatar: user.avatar,
+      accounttype: user.accounttype,
+      email_verified_at: user.email_verified_at,
+      two_factor_enabled: user.two_factor_enabled,
+      session_id: user.session_id,
+      has_password: !!user.password,
+    }
+  }
+
+  /**
+   * `accountType` used to be folded into the HMAC input to bind the flow to
+   * whichever choice (personal/business) step 1 recorded, so step 2
+   * couldn't submit a different one. There is no such choice anymore
+   * (Part 1) — every public signup is 'individual' — so the signature now
+   * only binds `flow_id` itself. Keeping `accountType` in the HMAC would
+   * also break under `RegisterDto`'s `whitelist: true` validation, which
+   * strips the (no longer declared) `accounttype` field from the request
+   * body before it reaches here.
+   */
   async createRegisterFlow(accountType: string) {
     const flow_id = crypto.randomBytes(16).toString('hex');
     const flow_signature = crypto
       .createHmac('sha256', this.FLOW_SECRET)
-      .update(flow_id + accountType)
+      .update(flow_id)
       .digest('hex');
 
     return { flow_id, flow_signature };
@@ -63,7 +109,7 @@ authenticator.options = {
 
   const expectedSignature = crypto
     .createHmac('sha256', this.FLOW_SECRET)
-    .update(token + data.accounttype)
+    .update(token)
     .digest('hex')
 
   if (signature !== expectedSignature) {
@@ -73,20 +119,14 @@ authenticator.options = {
   }
 
   const existingUser =
-    await this.prisma.users.findFirst({
-
-      where: {
-        OR: [
-          { email: data.email },
-          { username: data.username }
-        ]
-      }
+    await this.prisma.users.findUnique({
+      where: { email: data.email },
     })
 
   if (existingUser) {
 
     throw new BadRequestException(
-      'البريد الإلكتروني أو اسم المستخدم مستخدم بالفعل'
+      'البريد الإلكتروني مستخدم بالفعل'
     )
   }
 
@@ -95,6 +135,13 @@ authenticator.options = {
       data.password,
       10
     )
+
+  // `username` is no longer a registration field — see RegisterDto's
+  // comment. Derived the same way OAuth signup derives one.
+  const username = await generateUniqueUsername(
+    this.prisma,
+    `${data.first_name}${data.last_name}`,
+  )
 
   /**
    * ✅ otp
@@ -112,12 +159,28 @@ authenticator.options = {
       1 * 60 * 1000
     )
 
+  // Store identity/currency belong to the STORE (Part 2/3), validated
+  // up front so a bad slug/currency fails before any row is written.
+  const storeSlug = normalizeStoreSlug(data.store_slug || data.store_name)
+  assertNotReservedSlug(storeSlug)
+  const storeCurrency = assertSupportedCurrency(data.store_currency)
+
+  const slugTaken = await this.prisma.store.findUnique({ where: { slug: storeSlug } })
+  if (slugTaken) {
+    throw new ConflictException('رابط المتجر مستخدم بالفعل، اختر رابطاً آخر')
+  }
+
   return this.prisma.$transaction(
 
     async (tx) => {
 
       /**
        * ✅ create user
+       *
+       * There is no personal/business choice in public signup anymore —
+       * `accounttype` is always 'individual' here regardless of what the
+       * client sends; the column stays on the model only for OAuth's
+       * `action=business` path and pre-existing business accounts.
        */
       const user =
         await tx.users.create({
@@ -127,18 +190,22 @@ authenticator.options = {
             email:
               data.email,
 
-            username:
-              data.username,
+            username,
 
             password:
               hashedPassword,
 
+            // `users` has no dedicated first_name/last_name/phone columns —
+            // see FINAL_AUTH_SIGNUP_TECHNICAL_REPAIR_REPORT.md ("root
+            // cause"). They're still collected and validated on the signup
+            // form (RegisterDto) for product/UX reasons, and folded into
+            // `fullname` here, but not persisted as separate columns.
             fullname:
-              data.business_name ||
-              data.username,
+              `${data.first_name} ${data.last_name}`.trim() ||
+              username,
 
             accounttype:
-              data.accounttype,
+              'individual',
 
             country:
               data.country,
@@ -153,6 +220,38 @@ authenticator.options = {
               new Date(),
           }
         })
+
+      /**
+       * ✅ first store — created in the SAME transaction as the account so
+       * the two can never diverge (Part 31): either both exist, or neither
+       * does. Race-safety against a double-submit falls back on the DB's
+       * unique constraint on `store.slug` (caught below), since the
+       * findUnique pre-check above ran before this transaction opened.
+       */
+      let store
+      try {
+        store = await tx.store.create({
+          data: {
+            name: data.store_name,
+            slug: storeSlug,
+            currency: storeCurrency,
+            status: 1,
+            ownerId: user.id,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            is_default: true,
+          },
+        })
+      } catch (err: any) {
+        if (err?.code === 'P2002') {
+          throw new ConflictException('رابط المتجر مستخدم بالفعل، اختر رابطاً آخر')
+        }
+        throw err
+      }
+
+      await tx.storeTheme.create({
+        data: defaultStoreThemeData(store.id),
+      })
 
       /**
        * ✅ session id
@@ -322,6 +421,12 @@ authenticator.options = {
 
           two_factor_enabled:
             user.two_factor_enabled
+        },
+
+        store: {
+          slug: store.slug,
+          name: store.name,
+          currency: store.currency,
         }
       }
     }
@@ -983,10 +1088,25 @@ if (!user) {
   }
 }
 
+// ✅ منع تخمين الكود بالقوة الغاشمة
+const MAX_OTP_ATTEMPTS = 5
+
+if ((user.email_otp_attempts || 0) >= MAX_OTP_ATTEMPTS) {
+  return {
+    success: false,
+    message: 'تم تجاوز عدد المحاولات المسموح بها. الرجاء طلب كود جديد'
+  }
+}
+
 if (
 
   user.email_otp !== code
 ) {
+
+  await this.prisma.users.update({
+    where: { id: user.id },
+    data: { email_otp_attempts: { increment: 1 } }
+  })
 
   return {
 
@@ -1250,7 +1370,14 @@ async resendOtp(
 
       email_otp_resend_attempts: {
         increment: 1
-      }
+      },
+
+      // A fresh code must come with a fresh guess budget — otherwise a
+      // user who legitimately exhausts attempts on an old code could
+      // never recover, and an attacker could also inherit no benefit
+      // by inspecting resend behavior. See email_otp_attempts check in
+      // verifyOtp() for the corresponding lockout enforcement.
+      email_otp_attempts: 0
     }
   })
 
@@ -1583,11 +1710,22 @@ await this.prisma.users.update({
   authenticated: true,
   session_id: sessionId,
   device_id: device?.id,
+  // This is an AUTHORITATIVE authentication response — the frontend seeds
+  // its `['auth-user']` cache directly from it. It must therefore carry
+  // the same verification/profile facts `GET /auth/me` (`sanitizeUser`)
+  // returns, or a freshly-logged-in verified account momentarily looks
+  // unverified to the client (missing field -> treated as null) and gets
+  // bounced to `/verify-email`. Mirror `sanitizeUser` for the fields the
+  // email gate and onboarding actually read.
   user: {
     id: user.id.toString(),
     email: user.email,
     username: user.username,
-    two_factor_enabled: user.two_factor_enabled
+    fullname: user.fullname ?? null,
+    accounttype: user.accounttype ?? null,
+    two_factor_enabled: user.two_factor_enabled,
+    email_verified_at: user.email_verified_at ?? null,
+    has_password: !!user.password,
   }
 }
   }

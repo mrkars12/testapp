@@ -42,9 +42,16 @@ const INTENT_TRANSITIONS: IntentTransitionMap = {
   captured: ['partially_refunded', 'refunded'],
   partially_refunded: ['partially_refunded', 'refunded'],
   refunded: [],
-  failed: [],
-  cancelled: [],
-  expired: [],
+  // A declined, voided or abandoned attempt does NOT end the intent's
+  // ability to be paid: the payer can present another card, or pay the
+  // same provider object again (Moyasar's hosted invoice explicitly
+  // allows this). The only facts that may reopen one of these is money
+  // actually arriving — see `evaluateOrdering`'s recovery exception,
+  // which is what gates these edges. Nothing else about them changes:
+  // they remain the states reconciliation and the expiry job settle on.
+  failed: ['authorized', 'partially_captured', 'captured'],
+  cancelled: ['authorized', 'partially_captured', 'captured'],
+  expired: ['authorized', 'partially_captured', 'captured'],
 }
 
 const ATTEMPT_TRANSITIONS: AttemptTransitionMap = {
@@ -157,7 +164,38 @@ export function evaluateOrdering(
         (fact.status === 'partially_refunded' || fact.status === 'refunded')) ||
       (current.status === 'refunded' && fact.status === 'refunded')
 
-    if (!refundContinuation) {
+    /*
+     * The recovery exception.
+     *
+     * A declined attempt used to make the intent permanently terminal,
+     * so a *later, genuinely successful* payment for the same order was
+     * refused here with `terminal_state` — the provider had the money and
+     * this system had no order. Observed against the real Moyasar test
+     * account: attempt declined at 18:56:03, the payer paid again on the
+     * same invoice at 18:56:24, and the capture was recorded
+     * `applied = false, superseded_reason = terminal_state`.
+     *
+     * "المال يزيد بس" is this file's strongest ordering signal and it
+     * settles the case: a capture or an authorisation strictly increases
+     * secured money, so it cannot be the stale event. A decline carries
+     * no money at all and therefore cannot outrank one.
+     *
+     * Deliberately one-directional and deliberately narrow:
+     *   • only OUT of the unfunded terminal states (failed / cancelled /
+     *     expired) — `captured` and `refunded` are untouched, so a late
+     *     failure can still never unpay a paid order;
+     *   • only INTO a state that secured funds. A second decline on a
+     *     failed intent changes nothing and is still ignored.
+     */
+    const recovery =
+      (current.status === 'failed' ||
+        current.status === 'cancelled' ||
+        current.status === 'expired') &&
+      (fact.status === 'authorized' ||
+        fact.status === 'partially_captured' ||
+        fact.status === 'captured')
+
+    if (!refundContinuation && !recovery) {
       return { apply: false, reason: 'terminal_state' }
     }
   }

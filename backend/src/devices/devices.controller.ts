@@ -148,7 +148,7 @@ export class DevicesController {
       for (const device of devices) {
         const devIdStr = device.id.toString()
         this.realtime.notifyDeviceLogout(userIdStr, devIdStr)
-        this.realtime.forceLogoutDevice(userIdStr, devIdStr, '/dashboard') 
+        this.realtime.forceLogoutDevice(userIdStr, devIdStr, '/verify-email') 
       }
 
       // 🚩 [تم الحذف]: حذفت السطور المكررة الخاطئة التي كانت خارج الـ Loop هنا وكانت تسبب التشوه بصرياً
@@ -212,7 +212,7 @@ export class DevicesController {
       this.realtime.notifyDeviceLogout(userIdStr, devIdStr)
       
       // ✅ تصحيح المسار المقصود هنا أيضاً إلى /dashboard لمنع تضارب الرابط في التابات المنسوخة
-      this.realtime.forceLogoutDevice(userIdStr, devIdStr, '/dashboard')
+      this.realtime.forceLogoutDevice(userIdStr, devIdStr, '/verify-email')
 
       return { success: true }
     } catch (error) {

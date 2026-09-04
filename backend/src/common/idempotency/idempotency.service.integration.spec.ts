@@ -1,5 +1,5 @@
 import { ConfigService } from '@nestjs/config';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { IdempotencyService } from './idempotency.service';
 import {
   createAdditionalClient,
@@ -70,6 +70,17 @@ describe('IdempotencyService (integration)', () => {
   beforeEach(async () => {
     await resetTestDatabase();
   });
+
+  async function withTenant<T>(
+    storeId: bigint,
+    mode: 'live' | 'test',
+    cb: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    return prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT set_config('app.store_id', ${storeId.toString()}, true), set_config('app.mode', ${mode}, true)`;
+      return cb(tx as Prisma.TransactionClient);
+    });
+  }
 
   it('lets the first request proceed', async () => {
     const result = await service.claim(baseRequest());
@@ -205,13 +216,15 @@ describe('IdempotencyService (integration)', () => {
 
     expect(resumed.outcome).toBe('proceed');
 
-    const record = await prisma.paymentIdempotencyRecord.findFirst({
-      where: {
-        id: first.recordId,
-        store_id: STORE,
-        mode: MODE,
-      },
-    });
+    const record = await withTenant(STORE, MODE, (tx) =>
+      tx.paymentIdempotencyRecord.findFirst({
+        where: {
+          id: first.recordId,
+          store_id: STORE,
+          mode: MODE,
+        },
+      }),
+    );
 
     expect(record?.status).toBe('in_flight');
     expect(record?.response_body).toBeNull();
@@ -294,13 +307,15 @@ describe('IdempotencyService (integration)', () => {
       leaked: true,
     });
 
-    const record = await prisma.paymentIdempotencyRecord.findFirst({
-      where: {
-        id: first.recordId,
-        store_id: STORE,
-        mode: MODE,
-      },
-    });
+    const record = await withTenant(STORE, MODE, (tx) =>
+      tx.paymentIdempotencyRecord.findFirst({
+        where: {
+          id: first.recordId,
+          store_id: STORE,
+          mode: MODE,
+        },
+      }),
+    );
 
     expect(record?.status).toBe('in_flight');
   });
@@ -322,12 +337,14 @@ describe('IdempotencyService (integration)', () => {
 
     expect(purged).toBe(1);
 
-    const remaining = await prisma.paymentIdempotencyRecord.count({
-      where: {
-        store_id: STORE,
-        mode: MODE,
-      },
-    });
+    const remaining = await withTenant(STORE, MODE, (tx) =>
+      tx.paymentIdempotencyRecord.count({
+        where: {
+          store_id: STORE,
+          mode: MODE,
+        },
+      }),
+    );
 
     expect(remaining).toBe(1);
   });

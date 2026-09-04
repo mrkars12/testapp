@@ -39,8 +39,16 @@ export default function SocialAuthButtons({ mode, accountType = 'individual', cl
     // action يحدد المسار في الـ backend
     const action = mode === 'login' ? 'login' : accountType
 
-    window.location.href =
+    // `replace`, not `href =`: the current auth page (`/login` or
+    // `/register`) must not stay in history behind the OAuth round-trip.
+    // The provider bounces back to `/auth/oauth-success`, which itself
+    // `router.replace`s onward to the authenticated destination, so the
+    // whole social-login journey occupies one history slot and browser
+    // Back from the authenticated page never lands on `/login` or the
+    // OAuth callback.
+    window.location.replace(
       `${apiBase}/auth/oauth/${provider}?fingerprint=${encodeURIComponent(fingerprint)}&action=${action}`
+    )
   }
 
   return (

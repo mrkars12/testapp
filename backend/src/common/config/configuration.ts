@@ -20,8 +20,54 @@ function parseBoolOr(raw: string | undefined, fallback: boolean): boolean {
 export interface AppConfig {
   nodeEnv: string;
   isProduction: boolean;
+  /**
+   * Explicit opt-in for PrismaService.platform() to derive the platform
+   * connection from TEST_DATABASE_URL/DATABASE_URL when DATABASE_URL_PLATFORM
+   * is unset. NODE_ENV=development (the shared/deployed default) must NEVER
+   * be sufficient on its own — only NODE_ENV=test (set automatically by
+   * Jest) or an explicit ALLOW_PLATFORM_DB_FALLBACK=true opt-in enable it.
+   */
+  allowPlatformDbFallback: boolean;
   port: number;
   corsOrigins: string[];
+  /**
+   * The payment mode the PUBLIC storefront checkout transacts in.
+   *
+   * `live` always, except when a developer explicitly opts a
+   * non-production deployment into `test` so a gateway's own test
+   * account can be exercised against a real browser. It exists because
+   * the storefront previously hardcoded `'live'`, which made a merchant's
+   * configured *test* account unreachable from the storefront and left
+   * the embedded flow impossible to verify without live credentials.
+   *
+   * Production can NEVER be flipped by it: the check below refuses the
+   * override outright when NODE_ENV=production, so setting the variable
+   * on a production host is inert rather than dangerous. That is the same
+   * rule `allowPlatformDbFallback` follows, for the same reason — a
+   * deployment must not be able to change how real customers' money is
+   * handled through an environment variable someone set by accident.
+   *
+   * It selects which PaymentAccount and offerings the storefront sees.
+   * It does not change any gateway behaviour, any adapter, or anything
+   * about how a payment is verified: a `test` storefront runs exactly
+   * the same code against the merchant's test account.
+   */
+  storefrontPaymentMode: 'live' | 'test';
+  /**
+   * THE KILL SWITCH for server-authoritative cart identity.
+   *
+   * Default ON. When it is off the storefront controllers ignore the
+   * cart cookie entirely and every checkout takes the stateless path
+   * that existed before — the same behaviour as a browser that sends no
+   * cookie, which the backend has to tolerate anyway. That makes it a
+   * rollback without a deploy, which is worth having for the first week
+   * of a change that sits directly in the payment path.
+   *
+   * It does not delete or invalidate anything: existing carts stay in
+   * the database, and turning it back on resumes exactly where it left
+   * off.
+   */
+  cartIdentityEnabled: boolean;
 }
 export interface SecurityConfig {
   jwtSecret: string;
@@ -50,13 +96,41 @@ export interface TenantConfig {
   throwOnViolation: boolean;
 }
 
+/**
+ * Resolves the storefront's payment mode.
+ *
+ * Deliberately not `parseBoolOr`-shaped: the default is `live` and the
+ * ONLY value that changes it is the exact string `test`, on a
+ * non-production deployment. Anything else — unset, empty, misspelled,
+ * `live`, or `test` on production — is `live`.
+ */
+export function parseStorefrontPaymentMode(
+  raw: string | undefined,
+  nodeEnv: string | undefined,
+): 'live' | 'test' {
+  if (raw?.trim().toLowerCase() !== 'test') return 'live';
+  // A production deployment is never overridable. Setting the variable
+  // there is inert, not effective.
+  if (nodeEnv === 'production') return 'live';
+  return 'test';
+}
+
 export const appConfig = registerAs<AppConfig>('app', () => ({
   nodeEnv: process.env.NODE_ENV ?? 'development',
   isProduction: process.env.NODE_ENV === 'production',
+  allowPlatformDbFallback: parseBoolOr(
+    process.env.ALLOW_PLATFORM_DB_FALLBACK,
+    process.env.NODE_ENV === 'test',
+  ),
   port: parseIntOr(process.env.PORT, 4000),
   corsOrigins: parseList(
     process.env.CORS_ORIGINS ?? 'http://localhost:3000,*.localhost:3000',
   ),
+  storefrontPaymentMode: parseStorefrontPaymentMode(
+    process.env.STOREFRONT_PAYMENT_MODE,
+    process.env.NODE_ENV,
+  ),
+  cartIdentityEnabled: parseBoolOr(process.env.CART_IDENTITY_ENABLED, true),
 }));
 export const securityConfig = registerAs<SecurityConfig>('security', () => ({
   jwtSecret: process.env.JWT_SECRET as string,

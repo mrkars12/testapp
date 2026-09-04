@@ -11,8 +11,13 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { LedgerService } from '../../ledger/ledger.service';
 import { offlineCollected } from '../../ledger/posting-rules';
 import { OutboxService } from '../../common/messaging/outbox.service';
+import { IdempotencyService } from '../../common/idempotency/idempotency.service';
+import { fingerprintRequest } from '../../common/idempotency/idempotency.types';
 import { parseDecimal } from '../../common/money/money.util';
 import { assertIntentTransition } from './payment-intent.state';
+
+/** Idempotency scope for recording an offline collection. */
+export const COLLECT_SCOPE = 'payments.collect';
 
 /**
  * ==================================================================
@@ -38,209 +43,247 @@ export class PaymentCollectionService {
     private readonly prisma: PrismaService,
     private readonly ledger: LedgerService,
     private readonly outbox: OutboxService,
+    private readonly idempotency: IdempotencyService,
   ) {}
 
   async recordCollection(
     storeId: bigint,
     orderId: string,
-    options: { mode?: Mode; reference?: string } = {},
+    options: { mode?: Mode; reference?: string; idempotencyKey?: string } = {},
   ) {
     const mode: Mode = options.mode ?? 'live';
 
-    const order = await this.prisma.guarded().order.findFirst({
-      where: { id: BigInt(orderId), store_id: storeId },
-    });
-
-    if (!order) throw new NotFoundException('Order not found.');
-
-    if (order.payment_status === 'PAID') {
-      throw new ConflictException('Order is already marked as paid.');
-    }
-
-    if (order.payment_status === 'REFUNDED') {
-      throw new ConflictException('A refunded order cannot be marked as paid.');
-    }
-
-    // Legacy orders predate checkout and have no committed receivable, so
-    // posting a collection against them would drive offline_receivable
-    // negative. They must be reconciled by hand.
-    if (order.checkout_id === null) {
-      throw new BadRequestException(
-        'This order was not created through checkout and has no ledger entry to settle.',
-      );
-    }
-
-    const currency = (order.currency || 'USD').toUpperCase();
-    const total = parseDecimal(String(order.total), currency);
-
-    if (total.amountMinor <= 0n) {
-      throw new BadRequestException('Order total must be greater than zero.');
-    }
-
-    const intent = await this.prisma.guarded().paymentIntent.findFirst({
-      where: {
-        store_id: storeId,
+    return this.idempotency.runExclusive(
+      {
+        storeId,
         mode,
-        context_kind: 'checkout',
-        context_id: order.checkout_id.toString(),
+        scope: COLLECT_SCOPE,
+        idempotencyKey: options.idempotencyKey,
+        fingerprint: fingerprintRequest({
+          method: 'POST',
+          path: `/stores/payments/orders/${orderId}/collect`,
+          body: { mode, reference: options.reference ?? null },
+        }),
       },
-    });
+      () => this.runCollection(storeId, orderId, mode, options.reference),
+      {
+        inFlightMessage:
+          'This collection is already being recorded. Please wait a moment.',
+      },
+    );
+  }
 
-    if (!intent) {
-      throw new NotFoundException('No payment intent found for this order.');
-    }
+  /** The actual collection. Split out so idempotency can wrap it. */
+  private async runCollection(
+    storeId: bigint,
+    orderId: string,
+    mode: Mode,
+    reference?: string,
+  ) {
+    const options = { reference };
 
-    assertIntentTransition(intent.status, 'captured');
+    const updated = await this.prisma.withTenantTransaction(
+      storeId,
+      mode,
+      async (tx) => {
+        const order = await tx.order.findFirst({
+          where: { id: BigInt(orderId), store_id: storeId },
+        });
 
-    const beneficiary = await this.prisma.guarded().beneficiary.findFirst({
-      where: { store_id: storeId, mode, kind: 'store', external_ref: null },
-      select: { id: true },
-    });
+        if (!order) throw new NotFoundException('Order not found.');
 
-    if (!beneficiary) {
-      throw new NotFoundException('Store beneficiary is missing.');
-    }
+        if (order.payment_status === 'PAID') {
+          throw new ConflictException('Order is already marked as paid.');
+        }
 
-    const now = new Date();
+        if (order.payment_status === 'REFUNDED') {
+          throw new ConflictException(
+            'A refunded order cannot be marked as paid.',
+          );
+        }
 
-    const updated = await this.prisma.guarded().$transaction(async (tx) => {
-      // Compare-and-set claim. This is the concurrency guard: only one
-      // transaction can flip UNPAID -> PAID. A second concurrent caller
-      // blocks on the row lock, re-evaluates the WHERE after the first
-      // commits, matches nothing, and rolls back before writing a
-      // Capture.
-      //
-      // Capture has no unique constraint of its own, so without this the
-      // only thing preventing a duplicate would be the unique dedupe_key
-      // on payment_events happening to be inserted first. That is an
-      // ordering accident, not a guarantee.
-      const claimed = await tx.order.updateMany({
-        where: { id: order.id, store_id: storeId, payment_status: 'UNPAID' },
-        data: { payment_status: 'PAID', paid_at: now },
-      });
+        // Legacy orders predate checkout and have no committed receivable, so
+        // posting a collection against them would drive offline_receivable
+        // negative. They must be reconciled by hand.
+        if (order.checkout_id === null) {
+          throw new BadRequestException(
+            'This order was not created through checkout and has no ledger entry to settle.',
+          );
+        }
 
-      if (claimed.count === 0) {
-        throw new ConflictException(
-          'Order was marked as paid by another request.',
-        );
-      }
+        const currency = (order.currency || 'USD').toUpperCase();
+        const total = parseDecimal(String(order.total), currency);
 
-      const capture = await tx.capture.create({
-        data: {
-          intent_id: intent.id,
-          store_id: storeId,
+        if (total.amountMinor <= 0n) {
+          throw new BadRequestException(
+            'Order total must be greater than zero.',
+          );
+        }
+
+        const intent = await tx.paymentIntent.findFirst({
+          where: {
+            store_id: storeId,
+            mode,
+            context_kind: 'checkout',
+            context_id: order.checkout_id.toString(),
+          },
+        });
+
+        if (!intent) {
+          throw new NotFoundException('No payment intent found for this order.');
+        }
+
+        assertIntentTransition(intent.status, 'captured');
+
+        const beneficiary = await tx.beneficiary.findFirst({
+          where: { store_id: storeId, mode, kind: 'store', external_ref: null },
+          select: { id: true },
+        });
+
+        if (!beneficiary) {
+          throw new NotFoundException('Store beneficiary is missing.');
+        }
+
+        const now = new Date();
+
+        // Compare-and-set claim. This is the concurrency guard: only one
+        // transaction can flip UNPAID -> PAID. A second concurrent caller
+        // blocks on the row lock, re-evaluates the WHERE after the first
+        // commits, matches nothing, and rolls back before writing a
+        // Capture.
+        //
+        // Capture has no unique constraint of its own, so without this the
+        // only thing preventing a duplicate would be the unique dedupe_key
+        // on payment_events happening to be inserted first. That is an
+        // ordering accident, not a guarantee.
+        const claimed = await tx.order.updateMany({
+          where: { id: order.id, store_id: storeId, payment_status: 'UNPAID' },
+          data: { payment_status: 'PAID', paid_at: now },
+        });
+
+        if (claimed.count === 0) {
+          throw new ConflictException(
+            'Order was marked as paid by another request.',
+          );
+        }
+
+        const capture = await tx.capture.create({
+          data: {
+            intent_id: intent.id,
+            store_id: storeId,
+            mode,
+            amount_minor: total.amountMinor,
+            currency,
+            status: 'succeeded',
+            gateway_capture_ref: options.reference ?? null,
+            captured_at: now,
+          },
+          select: { id: true },
+        });
+
+        await tx.captureAllocation.create({
+          data: {
+            capture_id: capture.id,
+            beneficiary_id: beneficiary.id,
+            store_id: storeId,
+            mode,
+            amount_minor: total.amountMinor,
+            kind: 'revenue',
+          },
+        });
+
+        await tx.paymentIntent.update({
+          where: {
+            id: intent.id,
+            store_id: storeId,
+            mode,
+          },
+          data: {
+            status: 'captured',
+            captured_total_minor: total.amountMinor,
+            terminal_at: now,
+            version: { increment: 1 },
+          },
+        });
+
+        await tx.paymentAttempt.updateMany({
+          where: {
+            intent_id: intent.id,
+            store_id: storeId,
+            mode,
+            status: { notIn: ['succeeded', 'failed'] },
+          },
+          data: { status: 'succeeded', next_action_kind: 'none' },
+        });
+
+        await tx.paymentEvent.create({
+          data: {
+            intent_id: intent.id,
+            store_id: storeId,
+            mode,
+            event_type: 'payment.collected.offline',
+            dedupe_key: `intent:${intent.id}:collected`,
+            source: 'merchant',
+            applied: true,
+            payload_redacted: {
+              orderId: order.id.toString(),
+              amountMinor: total.amountMinor.toString(),
+              currency,
+              reference: options.reference ?? null,
+            } as Prisma.InputJsonValue,
+            occurred_at: now,
+          },
+        });
+
+        // Clears the receivable opened at commitment.
+        await this.ledger.post(tx, {
+          storeId,
           mode,
-          amount_minor: total.amountMinor,
           currency,
-          status: 'succeeded',
-          gateway_capture_ref: options.reference ?? null,
-          captured_at: now,
-        },
-        select: { id: true },
-      });
+          entryType: 'payment.collected.offline',
+          sourceKind: 'order',
+          sourceId: order.id.toString(),
+          dedupeKey: `order:${order.id}:collected`,
+          occurredAt: now,
+          memo: `Collection for order ${order.order_number}`,
+          postings: offlineCollected({ totalMinor: total.amountMinor }),
+        });
 
-      await tx.captureAllocation.create({
-        data: {
-          capture_id: capture.id,
-          beneficiary_id: beneficiary.id,
-          store_id: storeId,
-          mode,
-          amount_minor: total.amountMinor,
-          kind: 'revenue',
-        },
-      });
+        // Already updated by the claim above; read it back for the response.
+        const saved = await tx.order.findFirstOrThrow({
+          where: { id: order.id, store_id: storeId },
+          select: {
+            id: true,
+            order_number: true,
+            payment_status: true,
+            paid_at: true,
+            status: true,
+          },
+        });
 
-      await tx.paymentIntent.update({
-        where: {
-          id: intent.id,
-          store_id: storeId,
+        await this.outbox.emit(tx, {
+          storeId,
           mode,
-        },
-        data: {
-          status: 'captured',
-          captured_total_minor: total.amountMinor,
-          terminal_at: now,
-          version: { increment: 1 },
-        },
-      });
-
-      await tx.paymentAttempt.updateMany({
-        where: {
-          intent_id: intent.id,
-          store_id: storeId,
-          mode,
-          status: { notIn: ['succeeded', 'failed'] },
-        },
-        data: { status: 'succeeded', next_action_kind: 'none' },
-      });
-
-      await tx.paymentEvent.create({
-        data: {
-          intent_id: intent.id,
-          store_id: storeId,
-          mode,
-          event_type: 'payment.collected.offline',
-          dedupe_key: `intent:${intent.id}:collected`,
-          source: 'merchant',
-          applied: true,
-          payload_redacted: {
+          aggregateType: 'order',
+          aggregateId: order.id.toString(),
+          eventType: 'payment.collected',
+          payload: {
             orderId: order.id.toString(),
+            orderNumber: order.order_number,
+            intentId: intent.id.toString(),
+            captureId: capture.id.toString(),
             amountMinor: total.amountMinor.toString(),
             currency,
-            reference: options.reference ?? null,
-          } as Prisma.InputJsonValue,
-          occurred_at: now,
-        },
-      });
+          },
+          occurredAt: now,
+        });
 
-      // Clears the receivable opened at commitment.
-      await this.ledger.post(tx as unknown as Prisma.TransactionClient, {
-        storeId,
-        mode,
-        currency,
-        entryType: 'payment.collected.offline',
-        sourceKind: 'order',
-        sourceId: order.id.toString(),
-        dedupeKey: `order:${order.id}:collected`,
-        occurredAt: now,
-        memo: `Collection for order ${order.order_number}`,
-        postings: offlineCollected({ totalMinor: total.amountMinor }),
-      });
+        this.logger.log(
+          `Offline payment collected: store ${storeId} order ${saved.order_number} ${total.amountMinor} ${currency}`,
+        );
 
-      // Already updated by the claim above; read it back for the response.
-      const saved = await tx.order.findFirstOrThrow({
-        where: { id: order.id, store_id: storeId },
-        select: {
-          id: true,
-          order_number: true,
-          payment_status: true,
-          paid_at: true,
-          status: true,
-        },
-      });
-
-      await this.outbox.emit(tx as unknown as Prisma.TransactionClient, {
-        storeId,
-        mode,
-        aggregateType: 'order',
-        aggregateId: order.id.toString(),
-        eventType: 'payment.collected',
-        payload: {
-          orderId: order.id.toString(),
-          orderNumber: order.order_number,
-          intentId: intent.id.toString(),
-          captureId: capture.id.toString(),
-          amountMinor: total.amountMinor.toString(),
-          currency,
-        },
-        occurredAt: now,
-      });
-
-      return saved;
-    });
-
-    this.logger.log(
-      `Offline payment collected: store ${storeId} order ${updated.order_number} ${total.amountMinor} ${currency}`,
+        return saved;
+      },
     );
 
     return {
@@ -248,7 +291,10 @@ export class PaymentCollectionService {
       order_number: updated.order_number,
       status: updated.status,
       payment_status: updated.payment_status,
-      paid_at: updated.paid_at,
+      // ISO string, not a Date: an idempotent replay comes back through
+      // JSON, and a caller must not see a different type depending on
+      // whether it was the first request or a retry.
+      paid_at: updated.paid_at ? updated.paid_at.toISOString() : null,
     };
   }
 }

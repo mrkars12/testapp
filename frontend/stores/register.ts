@@ -7,7 +7,6 @@ export const useRegisterStore = create<any>((set) => ({
   form: {
     accounttype: 'individual',
     email: '',
-    username: '',
     password: '',
     password_confirmation: '',
     country: '',

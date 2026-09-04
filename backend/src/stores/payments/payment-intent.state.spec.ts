@@ -23,10 +23,29 @@ describe('intent transitions', () => {
     expect(canTransitionIntent('partially_captured', 'captured')).toBe(true)
   })
 
-  it('never leaves a terminal state', () => {
+  it('never re-opens a terminal state into a non-funded one', () => {
     for (const terminal of ['failed', 'cancelled', 'expired', 'refunded'] as const) {
       expect(canTransitionIntent(terminal, 'processing')).toBe(false)
-      expect(canTransitionIntent(terminal, 'captured')).toBe(false)
+      expect(canTransitionIntent(terminal, 'requires_action')).toBe(false)
+    }
+  })
+
+  it('never re-opens a FUNDED terminal state', () => {
+    // captured and refunded are the states where money actually moved.
+    // Nothing may take them back.
+    expect(canTransitionIntent('captured', 'processing')).toBe(false)
+    expect(canTransitionIntent('captured', 'failed')).toBe(false)
+    expect(canTransitionIntent('refunded', 'captured')).toBe(false)
+    expect(canTransitionIntent('refunded', 'failed')).toBe(false)
+  })
+
+  it('lets money recover an UNFUNDED terminal state', () => {
+    // The retry rule: a declined, cancelled or abandoned attempt leaves
+    // the order payable, so a later real payment is not "stale".
+    for (const terminal of ['failed', 'cancelled', 'expired'] as const) {
+      expect(canTransitionIntent(terminal, 'authorized')).toBe(true)
+      expect(canTransitionIntent(terminal, 'captured')).toBe(true)
+      expect(canTransitionIntent(terminal, 'partially_captured')).toBe(true)
     }
   })
 
@@ -89,6 +108,51 @@ describe('ordering guards', () => {
   it('rejects an event arriving after a terminal state', () => {
     expect(
       evaluateOrdering(snapshot('failed'), { status: 'processing' }),
+    ).toEqual({ apply: false, reason: 'terminal_state' })
+  })
+
+  it('lets a capture recover a failed intent (the retry rule)', () => {
+    expect(
+      evaluateOrdering(snapshot('failed'), {
+        status: 'captured',
+        cumulativeCapturedMinor: 5000n,
+      }),
+    ).toEqual({ apply: true })
+  })
+
+  it('lets a capture recover a cancelled intent', () => {
+    expect(
+      evaluateOrdering(snapshot('cancelled'), {
+        status: 'captured',
+        cumulativeCapturedMinor: 5000n,
+      }),
+    ).toEqual({ apply: true })
+  })
+
+  it('lets a capture recover an expired intent', () => {
+    expect(
+      evaluateOrdering(snapshot('expired'), {
+        status: 'captured',
+        cumulativeCapturedMinor: 5000n,
+      }),
+    ).toEqual({ apply: true })
+  })
+
+  it('does NOT let a failure undo a captured intent', () => {
+    expect(
+      evaluateOrdering(snapshot('captured', 5000n), { status: 'failed' }),
+    ).toEqual({ apply: false, reason: 'terminal_state' })
+  })
+
+  it('does NOT let a cancellation undo a captured intent', () => {
+    expect(
+      evaluateOrdering(snapshot('captured', 5000n), { status: 'cancelled' }),
+    ).toEqual({ apply: false, reason: 'terminal_state' })
+  })
+
+  it('does NOT reopen a failed intent into a non-funded state', () => {
+    expect(
+      evaluateOrdering(snapshot('failed'), { status: 'requires_action' }),
     ).toEqual({ apply: false, reason: 'terminal_state' })
   })
 

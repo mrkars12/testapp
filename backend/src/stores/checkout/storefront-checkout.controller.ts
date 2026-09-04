@@ -136,7 +136,7 @@ export class StorefrontCheckoutController {
     @Param('slug') slug: string,
     @Param('token') token: string,
   ) {
-    return this.checkout.syncCheckoutStatus(slug, token);
+    return this.checkout.syncCheckoutStatus(slug, token, this.mode);
   }
 
   /**
@@ -160,6 +160,7 @@ export class StorefrontCheckoutController {
       slug,
       token,
       body.payment_reference,
+      this.mode,
     );
   }
 
@@ -198,6 +199,6 @@ export class StorefrontCheckoutController {
     @Param('slug') slug: string,
     @Param('token') token: string,
   ) {
-    return this.checkout.getCheckoutStatus(slug, token);
+    return this.checkout.getCheckoutStatus(slug, token, this.mode);
   }
 }

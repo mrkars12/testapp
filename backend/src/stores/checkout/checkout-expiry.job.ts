@@ -147,8 +147,22 @@ export class CheckoutExpiryJob {
     const expired = await crossStoreQuery(
       'platform_sweep',
       'find expired uncommitted checkouts across all stores',
+      /*
+       * `platform()`, not `guarded()`, for the same reason the cart
+       * sweep below uses it: as of
+       * `20260904090000_enable_checkout_rls` the `checkouts` table
+       * carries an RLS policy, so a read with no tenant context
+       * installed sees NOTHING — this sweep would have quietly found
+       * zero expired checkouts forever and stock held by abandoned
+       * checkouts would never have been released.
+       *
+       * `dartstore_platform` holds SELECT on `checkouts` and nothing
+       * else: it reads identity (`id`, `store_id`, `mode`) here, and
+       * every write below happens inside the checkout's OWN tenant
+       * transaction. Nothing in this method writes cross-tenant.
+       */
       () =>
-        this.prisma.guarded().checkout.findMany({
+        this.prisma.platform().checkout.findMany({
           where: {
             // Only checkouts still waiting. A committed one owns its
             // stock, and a failed one was already released where it
@@ -272,14 +286,15 @@ export class CheckoutExpiryJob {
       'platform_sweep',
       'find expired carts across all stores',
       /*
-       * `platform()`, not `guarded()`, and for a concrete reason: unlike
-       * `checkouts`, the cart tables carry RLS policies, so a read with
-       * no tenant context installed sees nothing at all. That is the
-       * policy working — and a platform sweep is exactly the case the
-       * owner connection exists for. Same idiom as the outbox
-       * dispatcher's cross-store claim. Each cart is then updated inside
-       * its OWN tenant transaction below, so nothing here writes
-       * cross-tenant.
+       * `platform()`, not `guarded()`, and for a concrete reason: the
+       * cart tables carry RLS policies, so a read with no tenant
+       * context installed sees nothing at all. That is the policy
+       * working — and a platform sweep is exactly the case the owner
+       * connection exists for. Same idiom as the outbox dispatcher's
+       * cross-store claim, and as `releaseExpired` above, which now
+       * reads `checkouts` the same way for the same reason. Each cart
+       * is then updated inside its OWN tenant transaction below, so
+       * nothing here writes cross-tenant.
        */
       () =>
         this.prisma.platform().cart.findMany({

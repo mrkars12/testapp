@@ -65,18 +65,31 @@ echo "→ runtime roles"
   || fail "a runtime role is superuser or bypasses RLS"
 
 echo "→ row-level security"
-[[ "$(q "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relrowsecurity")" -ge 21 ]] \
-  || fail "expected at least 21 RLS-enabled tables"
-for t in Order OrderItem carts cart_items payment_intents payment_attempts inventory_reservations outbox_messages; do
+[[ "$(q "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relrowsecurity")" -ge 23 ]] \
+  || fail "expected at least 23 RLS-enabled tables"
+for t in Order OrderItem carts cart_items checkouts checkout_line_items payment_intents payment_attempts inventory_reservations outbox_messages; do
   [[ "$(q "SELECT relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND relname='$t'")" == "t" ]] \
     || fail "RLS not enabled on $t"
 done
 [[ "$(q "SELECT count(*) FROM pg_policy pol JOIN pg_class cls ON cls.oid=pol.polrelid WHERE cls.relname='Order' AND pol.polname='order_store_isolation'")" == 1 ]] \
   || fail "order_store_isolation missing (the policy the RLS migration used to only ALTER)"
 
+# `checkouts` holds more customer PII than any other table and was the
+# last tenant-scoped table without a policy. Both halves are asserted by
+# name: the tenant policy, and the parent-scoped one on its line items.
+for pol in checkouts:checkout_store_isolation checkout_line_items:checkout_line_item_store_isolation; do
+  [[ "$(q "SELECT count(*) FROM pg_policy pol JOIN pg_class cls ON cls.oid=pol.polrelid WHERE cls.relname='${pol%%:*}' AND pol.polname='${pol##*:}'")" == 1 ]] \
+    || fail "${pol##*:} missing on ${pol%%:*}"
+done
+# The checkout policy must test BOTH store and mode. A policy that
+# dropped the mode half would still pass every "is RLS on?" check above
+# while letting a live-mode request read test-mode checkouts.
+[[ "$(q "SELECT count(*) FROM pg_policies WHERE tablename='checkouts' AND policyname='checkout_store_isolation' AND qual LIKE '%app.store_id%' AND qual LIKE '%app.mode%'")" == 1 ]] \
+  || fail "checkout_store_isolation does not scope by BOTH store_id and mode"
+
 echo "→ platform least privilege"
 PLATFORM_PRIVS="$(q "SELECT string_agg(table_name||':'||privilege_type,',' ORDER BY table_name,privilege_type) FROM information_schema.table_privileges WHERE grantee='dartstore_platform'")"
-EXPECTED="carts:SELECT,outbox_messages:SELECT,outbox_messages:UPDATE,payment_accounts:SELECT,payment_idempotency_records:DELETE,payment_idempotency_records:SELECT,payment_intents:SELECT,webhook_events:INSERT,webhook_events:SELECT,webhook_events:UPDATE"
+EXPECTED="carts:SELECT,checkouts:SELECT,outbox_messages:SELECT,outbox_messages:UPDATE,payment_accounts:SELECT,payment_idempotency_records:DELETE,payment_idempotency_records:SELECT,payment_intents:SELECT,webhook_events:INSERT,webhook_events:SELECT,webhook_events:UPDATE"
 [[ "$PLATFORM_PRIVS" == "$EXPECTED" ]] \
   || fail "platform privileges drifted.\n  expected: $EXPECTED\n  actual:   $PLATFORM_PRIVS"
 # Neither role may TRUNCATE: TRUNCATE ignores RLS entirely.

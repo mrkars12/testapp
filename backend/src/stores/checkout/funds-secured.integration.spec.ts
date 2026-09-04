@@ -233,6 +233,22 @@ describe('funds_secured checkout (integration)', () => {
     });
   }
 
+
+  /*
+   * `checkouts` and `checkout_line_items` carry RLS as of
+   * `20260904090000_enable_checkout_rls`, so a bare client read sees
+   * NOTHING — this harness connects as `dartstore_app`, the role the
+   * policies target. Assertions therefore go through tenant context,
+   * which is both what the application does and, incidentally, standing
+   * proof that the policy is switched on: if it ever stopped being,
+   * these reads would keep passing, but the cross-store and cross-mode
+   * specs below would start failing.
+   */
+  const asTenant = <T>(
+    fn: (tx: Prisma.TransactionClient) => Promise<T>,
+    storeId?: bigint,
+  ): Promise<T> => withTenant(storeId ?? fx.storeId, 'live', fn);
+
   let carts: CartService;
 
   const buildCheckout = (result: InitializeResult) =>
@@ -333,7 +349,7 @@ describe('funds_secured checkout (integration)', () => {
         SLUG,
         body(fx, fx.gatewayOfferingId),
       );
-      const checkout = await prisma.checkout.findFirstOrThrow({});
+      const checkout = await asTenant((tx) => tx.checkout.findFirstOrThrow({}));
       expect(checkout.status).toBe('pending_payment');
       expect(checkout.order_id).toBeNull();
     });
@@ -397,7 +413,7 @@ describe('funds_secured checkout (integration)', () => {
     it('links the checkout to the order', async () => {
       await applier.apply(captureFact(fx, 5000n), 'webhook');
 
-      const checkout = await prisma.checkout.findFirstOrThrow({});
+      const checkout = await asTenant((tx) => tx.checkout.findFirstOrThrow({}));
       const order = await withTenant(fx.storeId, 'live', (tx) => tx.order.findFirstOrThrow({}));
       expect(checkout.status).toBe('committed');
       expect(checkout.order_id).toBe(order.id);
@@ -489,7 +505,7 @@ describe('funds_secured checkout (integration)', () => {
     it('marks the checkout failed and posts nothing', async () => {
       await applier.apply(failFact(fx), 'webhook');
 
-      const checkout = await prisma.checkout.findFirstOrThrow({});
+      const checkout = await asTenant((tx) => tx.checkout.findFirstOrThrow({}));
       expect(checkout.status).toBe('failed');
       expect(await withTenant(fx.storeId, 'live', (tx) => tx.journalEntry.count())).toBe(0);
     });
@@ -1307,9 +1323,9 @@ describe('funds_secured checkout (integration)', () => {
 
     /** Moves the checkout's expiry into the past. */
     async function expireIt(): Promise<void> {
-      await prisma.checkout.updateMany({
+      await asTenant((tx) => tx.checkout.updateMany({
         data: { expires_at: new Date(Date.now() - 60_000) },
-      });
+      }));
     }
 
     it('releases held stock once the checkout expires', async () => {
@@ -1326,7 +1342,7 @@ describe('funds_secured checkout (integration)', () => {
       );
       expect(reservation.state).toBe('expired');
 
-      const checkout = await prisma.checkout.findFirstOrThrow({});
+      const checkout = await asTenant((tx) => tx.checkout.findFirstOrThrow({}));
       expect(checkout.status).toBe('expired');
     });
 
@@ -1757,9 +1773,9 @@ describe('funds_secured checkout (integration)', () => {
       // The shopper walks away and the sweep reclaims the hold. This is
       // the real job, not a hand-written UPDATE, so the state it writes
       // is the state production writes.
-      await prisma.checkout.updateMany({
+      await asTenant((tx) => tx.checkout.updateMany({
         data: { expires_at: new Date(Date.now() - 60_000) },
-      });
+      }));
       expect(await new CheckoutExpiryJob(prisma as never).releaseExpired()).toBe(1);
 
       const swept = await withTenant(fx.storeId, 'live', (tx) =>
@@ -1844,9 +1860,9 @@ describe('funds_secured checkout (integration)', () => {
       );
 
       // Expired by the sweep — the units go back to the pool.
-      await prisma.checkout.updateMany({
+      await asTenant((tx) => tx.checkout.updateMany({
         data: { expires_at: new Date(Date.now() - 60_000) },
-      });
+      }));
       expect(await new CheckoutExpiryJob(prisma as never).releaseExpired()).toBe(1);
 
       // Someone else legitimately buys them and pays.
@@ -1941,7 +1957,7 @@ describe('funds_secured checkout (integration)', () => {
        */
       expect(await withTenant(fx.storeId, 'live', (tx) => tx.order.count())).toBe(0);
 
-      const checkouts = await prisma.checkout.findMany();
+      const checkouts = await asTenant((tx) => tx.checkout.findMany());
       expect(checkouts).toHaveLength(1);
       expect(checkouts[0].status).toBe('failed');
       expect(checkouts[0].order_id).toBeNull();

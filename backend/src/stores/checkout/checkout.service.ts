@@ -632,6 +632,10 @@ export class CheckoutService {
         const incumbent = await this.getCheckoutStatus(
           await this.slugFor(store.id),
           claim.checkoutToken,
+          // The converging tab reads the incumbent in the mode this
+          // request is transacting in — the same mode the incumbent was
+          // created in, since both tabs are the same storefront.
+          mode,
         );
 
         const action = incumbent.next_action as
@@ -1817,48 +1821,84 @@ export class CheckoutService {
     mode: Mode,
     checkoutId: bigint,
   ): Promise<string | null> {
-    const db = this.prisma.guarded();
+    /*
+     * TENANT TRANSACTION, not the bare guarded client.
+     *
+     * `checkouts` carries RLS as of
+     * `20260904090000_enable_checkout_rls`, so a read with no
+     * `app.store_id`/`app.mode` installed sees nothing at all — this
+     * walk would have silently reported "no successor" for every
+     * checkout that has one, which is precisely the answer a page
+     * restored from history must not be given. The whole walk runs in
+     * ONE transaction: the chain is read at a single point in time, so
+     * a successor committed mid-walk cannot make the traversal see a
+     * half-updated chain.
+     */
     const seen = new Set<string>([checkoutId.toString()]);
     const found: { id: bigint; token: string; committed: boolean }[] = [];
     let frontier: bigint[] = [checkoutId];
 
-    for (let depth = 0; depth < MAX_SUCCESSION_DEPTH; depth += 1) {
-      if (frontier.length === 0) break;
+    await this.prisma.withTenantTransaction(storeId, mode, async (tx) => {
+      for (let depth = 0; depth < MAX_SUCCESSION_DEPTH; depth += 1) {
+        if (frontier.length === 0) break;
 
-      const rows = await db.checkout.findMany({
-        where: { store_id: storeId, mode, supersedes_id: { in: frontier } },
-        select: { id: true, token: true, order_id: true },
-        orderBy: { id: 'asc' },
-        take: MAX_SUCCESSION_NODES,
-      });
-
-      frontier = [];
-      for (const row of rows) {
-        const key = row.id.toString();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        found.push({
-          id: row.id,
-          token: row.token,
-          // An Order exists only where funds were secured. Used to
-          // CHOOSE between successors, never reported as an outcome.
-          committed: row.order_id !== null,
+        const rows = await tx.checkout.findMany({
+          where: { store_id: storeId, mode, supersedes_id: { in: frontier } },
+          select: { id: true, token: true, order_id: true },
+          orderBy: { id: 'asc' },
+          take: MAX_SUCCESSION_NODES,
         });
-        frontier.push(row.id);
-      }
 
-      if (seen.size >= MAX_SUCCESSION_NODES) break;
-    }
+        frontier = [];
+        for (const row of rows) {
+          const key = row.id.toString();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          found.push({
+            id: row.id,
+            token: row.token,
+            // An Order exists only where funds were secured. Used to
+            // CHOOSE between successors, never reported as an outcome.
+            committed: row.order_id !== null,
+          });
+          frontier.push(row.id);
+        }
+
+        if (seen.size >= MAX_SUCCESSION_NODES) break;
+      }
+    });
 
     return chooseSuccessor(found)?.token ?? null;
   }
 
-  async getCheckoutStatus(slug: string, token: string) {
+  /**
+   * `mode` is supplied by the CALLER, not discovered from the row.
+   *
+   * It used to be read off the checkout: find the row by token, then
+   * use whatever mode it carried. That is impossible under the RLS
+   * policy `20260904090000_enable_checkout_rls` installs, which tests
+   * `mode = current_setting('app.mode')` — the row cannot be read
+   * without already knowing the mode, and reading it in the wrong mode
+   * is exactly what the policy exists to prevent.
+   *
+   * The storefront already knows: `StorefrontCheckoutController.mode`
+   * resolves it per request from `AppConfig.storefrontPaymentMode`, and
+   * it is the same value `createAndCommit` was already given when this
+   * checkout was created. So the answer was always in scope one frame
+   * up; it simply was not passed down. Defaulted to `live` to match
+   * `createAndCommit`, so no caller signature is broken.
+   */
+  async getCheckoutStatus(slug: string, token: string, mode: Mode = 'live') {
     const store = await this.findStore(slug);
 
-    const checkout = await this.prisma.guarded().checkout.findFirst({
-      where: { store_id: store.id, token },
-    });
+    const checkout = await this.prisma.withTenantTransaction(
+      store.id,
+      mode,
+      (tx) =>
+        tx.checkout.findFirst({
+          where: { store_id: store.id, mode, token },
+        }),
+    );
 
     if (!checkout) throw new NotFoundException('Checkout not found.');
 
@@ -2311,13 +2351,21 @@ export class CheckoutService {
     slug: string,
     token: string,
     paymentReference: string,
+    mode: Mode = 'live',
   ) {
     const store = await this.findStore(slug);
 
-    const checkout = await this.prisma.guarded().checkout.findFirst({
-      where: { store_id: store.id, token },
-      select: { id: true, mode: true },
-    });
+    // Tenant-scoped read — see `getCheckoutStatus` for why `mode` is a
+    // parameter rather than something discovered from the row.
+    const checkout = await this.prisma.withTenantTransaction(
+      store.id,
+      mode,
+      (tx) =>
+        tx.checkout.findFirst({
+          where: { store_id: store.id, mode, token },
+          select: { id: true, mode: true },
+        }),
+    );
 
     if (!checkout) throw new NotFoundException('Checkout not found.');
 
@@ -2423,7 +2471,7 @@ export class CheckoutService {
       await this.applier.applyMany(facts, 'return_url');
     }
 
-    return this.getCheckoutStatus(slug, token);
+    return this.getCheckoutStatus(slug, token, mode);
   }
 
   /**
@@ -2482,13 +2530,20 @@ export class CheckoutService {
    * Safe to call repeatedly. The facts go through the same applier, so a
    * status the webhook already applied is recognised as a duplicate.
    */
-  async syncCheckoutStatus(slug: string, token: string) {
+  async syncCheckoutStatus(slug: string, token: string, mode: Mode = 'live') {
     const store = await this.findStore(slug);
 
-    const checkout = await this.prisma.guarded().checkout.findFirst({
-      where: { store_id: store.id, token },
-      select: { id: true, mode: true },
-    });
+    // Tenant-scoped read — see `getCheckoutStatus` for why `mode` is a
+    // parameter rather than something discovered from the row.
+    const checkout = await this.prisma.withTenantTransaction(
+      store.id,
+      mode,
+      (tx) =>
+        tx.checkout.findFirst({
+          where: { store_id: store.id, mode, token },
+          select: { id: true, mode: true },
+        }),
+    );
 
     if (!checkout) throw new NotFoundException('Checkout not found.');
 
@@ -2516,7 +2571,7 @@ export class CheckoutService {
       );
     }
 
-    return this.getCheckoutStatus(slug, token);
+    return this.getCheckoutStatus(slug, token, mode);
   }
 
   /**

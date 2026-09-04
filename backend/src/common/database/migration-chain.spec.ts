@@ -157,6 +157,41 @@ describe('the migration chain', () => {
     }
   });
 
+  /**
+   * Every tenant-scoped table must actually carry a policy.
+   *
+   * `checkouts` spent four migrations registered as tenant-scoped, and
+   * holding more customer PII than any other table, while having no RLS
+   * at all — not because anyone decided that, but because nothing
+   * asserted the opposite. This is that assertion. It is deliberately
+   * about the CHAIN rather than a live database, so it fails in
+   * `npx jest` rather than only in the Docker replay gate.
+   */
+  it('enables RLS on both checkout tables and scopes them by store AND mode', () => {
+    const chain = migrations.map(statementsOf).join('\n');
+
+    for (const table of ['checkouts', 'checkout_line_items']) {
+      expect(chain).toMatch(
+        new RegExp(`ALTER TABLE "${table}" ENABLE ROW LEVEL SECURITY`),
+      );
+    }
+
+    // The parent-scoped shape: `checkout_line_items` has no store_id of
+    // its own, so its policy must reach through `checkouts` — and carry
+    // the mode, or a live request could read test-mode line items.
+    const lineItemPolicy = chain.slice(
+      chain.indexOf('CREATE POLICY checkout_line_item_store_isolation'),
+    );
+    expect(lineItemPolicy).toContain('FROM "checkouts" c');
+    expect(lineItemPolicy).toContain('c.mode::text');
+
+    const checkoutPolicy = chain.slice(
+      chain.indexOf('CREATE POLICY checkout_store_isolation'),
+    );
+    expect(checkoutPolicy).toContain("app.store_id");
+    expect(checkoutPolicy).toContain("app.mode");
+  });
+
   it('never puts a credential in a migration', () => {
     /*
      * Migrations are committed; passwords are not. The two runtime roles

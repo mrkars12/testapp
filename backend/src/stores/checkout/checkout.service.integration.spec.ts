@@ -1,8 +1,8 @@
 import { appConfigStub } from '../../../test/config.stub';
 import { TenantContextService } from '../../common/tenant/tenant-context.service';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import type { CheckoutStatus } from '@prisma/client';
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { DecryptionError } from '../../common/crypto/key-provider.interface';
 import { CheckoutService } from './checkout.service';
 import { OrderService } from '../orders/order.service';
@@ -149,6 +149,21 @@ describe('CheckoutService (integration)', () => {
   let carts: CartService;
   let fx: Fixture;
 
+  /*
+   * `checkouts` and `checkout_line_items` carry RLS as of
+   * `20260904090000_enable_checkout_rls`, so a bare client read sees
+   * NOTHING — this harness connects as `dartstore_app`, the role the
+   * policies target. Assertions therefore go through tenant context,
+   * which is both what the application does and, incidentally, standing
+   * proof that the policy is switched on: if it ever stopped being,
+   * these reads would keep passing, but the cross-store and cross-mode
+   * specs below would start failing.
+   */
+  const asTenant = <T>(
+    fn: (tx: Prisma.TransactionClient) => Promise<T>,
+    storeId?: bigint,
+  ): Promise<T> => withTestTenant(storeId ?? fx.storeId, fn);
+
   beforeAll(async () => {
     prisma = await startTestDatabase();
 
@@ -237,6 +252,176 @@ describe('CheckoutService (integration)', () => {
 
     expect(crossStore.orders).toHaveLength(0);
     expect(crossStore.items).toHaveLength(0);
+  });
+
+  /* ══════════════════════════════════════════════════════════════════
+     HIGH-3 — ROW LEVEL SECURITY ON THE CHECKOUT TABLES.
+
+     `checkouts` was the last tenant-scoped table without a policy, and
+     the one holding the most customer PII: name, email, phone and the
+     shipping address. `20260904090000_enable_checkout_rls` closed it.
+
+     These assert the policy from the outside — through the same
+     `dartstore_app` role the application runs as — rather than trusting
+     that the migration was written correctly. Store isolation, mode
+     isolation, the line-item table's parent-scoped policy, and the
+     WITH CHECK half that stops a write into someone else's tenant.
+     ══════════════════════════════════════════════════════════════════ */
+
+  /** A tenant transaction in an arbitrary mode, which `withTestTenant` pins to `live`. */
+  const inMode = <T>(
+    storeId: bigint,
+    mode: 'live' | 'test',
+    cb: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> =>
+    prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        SELECT set_config('app.store_id', ${storeId.toString()}, true),
+               set_config('app.mode', ${mode}, true)
+      `;
+      return cb(tx);
+    });
+
+  it('enforces PostgreSQL RLS for checkouts and checkout_line_items', async () => {
+    const placed = await service.createAndCommit(SLUG, {
+      items: [{ variant_id: fx.variantId.toString(), quantity: 1 }],
+      customer_name: 'RLS Checkout Buyer',
+      customer_phone: '01000000000',
+      address_line: 'RLS Test Street',
+      city: 'Cairo',
+      payment_offering_id: fx.offeringId.toString(),
+    });
+
+    const checkout = await asTenant((tx) =>
+      tx.checkout.findFirstOrThrow({ where: { token: placed.checkout_token } }),
+    );
+
+    // 1. The owning tenant reads its own checkout and its line items.
+    await withTestTenant(fx.storeId, async (tx) => {
+      expect(
+        await tx.checkout.findMany({ where: { id: checkout.id } }),
+      ).toHaveLength(1);
+      expect(
+        await tx.checkoutLineItem.findMany({
+          where: { checkout_id: checkout.id },
+        }),
+      ).toHaveLength(1);
+    });
+
+    // 2. NO tenant context at all — the case the four unconverted reads
+    //    used to run in. Raw SQL, so this is the table answering, not
+    //    Prisma's own where clause.
+    const withoutContext = await prisma.$transaction(async (tx) => ({
+      checkouts: await tx.$queryRaw<
+        Array<{ id: bigint }>
+      >`SELECT id FROM "checkouts" WHERE id = ${checkout.id}`,
+      items: await tx.$queryRaw<
+        Array<{ id: bigint }>
+      >`SELECT id FROM "checkout_line_items" WHERE checkout_id = ${checkout.id}`,
+    }));
+
+    expect(withoutContext.checkouts).toHaveLength(0);
+    expect(withoutContext.items).toHaveLength(0);
+
+    // 3. CROSS-STORE — another tenant sees neither the checkout nor,
+    //    through the parent-scoped policy, its line items.
+    const crossStore = await withTestTenant(fx.storeId + 999n, async (tx) => ({
+      checkouts: await tx.checkout.findMany({ where: { id: checkout.id } }),
+      items: await tx.checkoutLineItem.findMany({
+        where: { checkout_id: checkout.id },
+      }),
+    }));
+
+    expect(crossStore.checkouts).toHaveLength(0);
+    expect(crossStore.items).toHaveLength(0);
+
+    // 4. CROSS-MODE — the same store, the wrong mode. This is the half a
+    //    store-only policy would have missed entirely.
+    const crossMode = await inMode(fx.storeId, 'test', async (tx) => ({
+      checkouts: await tx.checkout.findMany({ where: { id: checkout.id } }),
+      items: await tx.checkoutLineItem.findMany({
+        where: { checkout_id: checkout.id },
+      }),
+    }));
+
+    expect(crossMode.checkouts).toHaveLength(0);
+    expect(crossMode.items).toHaveLength(0);
+  });
+
+  it('refuses to WRITE a checkout into another tenant', async () => {
+    // The USING half hides other tenants' rows; this is the WITH CHECK
+    // half, which stops a row being CREATED somewhere it would then be
+    // invisible. Without it a tenant could plant rows in another store.
+    const foreignStoreId = fx.storeId + 999n;
+
+    await expect(
+      withTestTenant(fx.storeId, (tx) =>
+        tx.checkout.create({
+          data: {
+            store_id: foreignStoreId,
+            mode: 'live',
+            token: 'rls-write-probe',
+            status: 'open',
+            currency: 'USD',
+            quote_total_minor: 100n,
+            expires_at: new Date(Date.now() + 30 * 60 * 1000),
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+
+    // And nothing landed.
+    const planted = await prisma.$queryRaw<
+      Array<{ id: bigint }>
+    >`SELECT id FROM "checkouts" WHERE token = 'rls-write-probe'`;
+    expect(planted).toHaveLength(0);
+  });
+
+  it('refuses to WRITE a checkout into another mode', async () => {
+    await expect(
+      inMode(fx.storeId, 'live', (tx) =>
+        tx.checkout.create({
+          data: {
+            store_id: fx.storeId,
+            mode: 'test',
+            token: 'rls-mode-write-probe',
+            status: 'open',
+            currency: 'USD',
+            quote_total_minor: 100n,
+            expires_at: new Date(Date.now() + 30 * 60 * 1000),
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it('still serves the storefront read paths, which is what RLS could have broken', async () => {
+    // The regression this whole change risks: the status endpoint, the
+    // succession walk and the sync path all read `checkouts` and all now
+    // do it inside tenant context. If the mode were not threaded through
+    // from the controller, every one of these would 404.
+    const placed = await service.createAndCommit(SLUG, {
+      items: [{ variant_id: fx.variantId.toString(), quantity: 1 }],
+      customer_name: 'RLS Status Buyer',
+      customer_phone: '01000000000',
+      address_line: 'RLS Test Street',
+      city: 'Cairo',
+      payment_offering_id: fx.offeringId.toString(),
+    });
+
+    const status = await service.getCheckoutStatus(
+      SLUG,
+      placed.checkout_token,
+      'live',
+    );
+
+    expect(status.checkout_token).toBe(placed.checkout_token);
+
+    // The wrong mode must NOT be a way to read it — the endpoint is
+    // token-addressed and the token travels in a URL.
+    await expect(
+      service.getCheckoutStatus(SLUG, placed.checkout_token, 'test'),
+    ).rejects.toThrow(NotFoundException);
   });
 
   it('returns a 400, not an unhandled 500, when the gateway account credentials fail to decrypt', async () => {
@@ -347,9 +532,9 @@ describe('CheckoutService (integration)', () => {
       payment_offering_id: fx.offeringId.toString(),
     });
 
-    const checkout = await prisma.checkout.findFirstOrThrow({
+    const checkout = await asTenant((tx) => tx.checkout.findFirstOrThrow({
       where: { store_id: fx.storeId },
-    });
+    }));
     expect(checkout.quote_total_minor).toBe(2500n);
   });
 
@@ -363,8 +548,8 @@ describe('CheckoutService (integration)', () => {
       payment_offering_id: fx.offeringId.toString(),
     });
 
-    expect(await prisma.checkout.count()).toBe(1);
-    expect(await prisma.checkoutLineItem.count()).toBe(1);
+    expect(await asTenant((tx) => tx.checkout.count())).toBe(1);
+    expect(await asTenant((tx) => tx.checkoutLineItem.count())).toBe(1);
     expect(await prisma.quoteComponent.count()).toBe(1);
     await withTestTenant(fx.storeId, async (tx) => {
       expect(await tx.paymentIntent.count()).toBe(1);
@@ -494,7 +679,7 @@ describe('CheckoutService (integration)', () => {
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
 
-    expect(await prisma.checkout.count()).toBe(0);
+    expect(await asTenant((tx) => tx.checkout.count())).toBe(0);
     expect(await prisma.order.count()).toBe(0);
     expect(await prisma.journalEntry.count()).toBe(0);
   });
@@ -1120,7 +1305,7 @@ describe('CheckoutService (integration)', () => {
   describe('customer PII is returned only while the checkout is payable', () => {
     /** A checkout of THIS store, in a given state. */
     async function seedCheckout(status: CheckoutStatus, token: string) {
-      return prisma.checkout.create({
+      return asTenant((tx) => tx.checkout.create({
         data: {
           store_id: fx.storeId,
           mode: 'live',
@@ -1139,7 +1324,7 @@ describe('CheckoutService (integration)', () => {
           selected_offering_id: fx.offeringId,
           expires_at: new Date(Date.now() + 30 * 60 * 1000),
         },
-      });
+      }));
     }
 
     it('A — an active unpaid checkout returns the retry details', async () => {
@@ -1213,7 +1398,7 @@ describe('CheckoutService (integration)', () => {
   it('does not expose another store checkout by token', async () => {
     const other = await seedOtherStore(prisma);
 
-    const checkout = await prisma.checkout.create({
+    const checkout = await asTenant((tx) => tx.checkout.create({
       data: {
         store_id: other.storeId,
         mode: 'live',
@@ -1231,7 +1416,10 @@ describe('CheckoutService (integration)', () => {
         selected_offering_id: other.offeringId,
         expires_at: new Date(Date.now() + 30 * 60 * 1000),
       },
-    });
+    // The other store's row is seeded in the other store's context: the
+    // RLS WITH CHECK clause refuses it from this one, which is the
+    // policy working rather than a broken fixture.
+    }), other.storeId);
 
     await expect(
       service.getCheckoutStatus(SLUG, checkout.token),
@@ -1270,7 +1458,7 @@ describe('CheckoutService (integration)', () => {
       phone?: string;
       email?: string | null;
     }) {
-      return prisma.checkout.create({
+      return asTenant((tx) => tx.checkout.create({
         data: {
           store_id: fx.storeId,
           mode: 'live',
@@ -1291,7 +1479,7 @@ describe('CheckoutService (integration)', () => {
           supersedes_id: over.supersedes_id ?? null,
           order_id: over.order_id ?? null,
         },
-      });
+      }));
     }
 
     const create = (over: Partial<CreateCheckoutDto> = {}) =>
@@ -1421,7 +1609,7 @@ describe('CheckoutService (integration)', () => {
 
     it('IGNORES a token belonging to ANOTHER STORE', async () => {
       const other = await seedOtherStore(prisma);
-      const foreign = await prisma.checkout.create({
+      const foreign = await asTenant((tx) => tx.checkout.create({
         data: {
           store_id: other.storeId,
           mode: 'live',
@@ -1434,13 +1622,16 @@ describe('CheckoutService (integration)', () => {
           quote_total_minor: 2500n,
           expires_at: new Date(Date.now() + 30 * 60 * 1000),
         },
-      });
+      // Seeded in the OTHER store's tenant context: the RLS WITH CHECK
+      // clause would refuse this INSERT from this store's context, which
+      // is the policy doing its job rather than a broken fixture.
+      }), other.storeId);
 
       await create({ supersedes_checkout_token: 'foreign-token' });
 
-      const linked = await prisma.checkout.findFirst({
+      const linked = await asTenant((tx) => tx.checkout.findFirst({
         where: { supersedes_id: foreign.id },
-      });
+      }));
       expect(linked).toBeNull();
     });
 
@@ -1450,10 +1641,10 @@ describe('CheckoutService (integration)', () => {
       const a = await seedCheckout({ token: 'cycle-a' });
       const b = await create({ supersedes_checkout_token: a.token });
 
-      const rows = await prisma.checkout.findMany({
+      const rows = await asTenant((tx) => tx.checkout.findMany({
         where: { store_id: fx.storeId },
         select: { id: true, supersedes_id: true },
-      });
+      }));
       for (const row of rows) {
         expect(row.supersedes_id).not.toBe(row.id);
         if (row.supersedes_id !== null)
@@ -1621,7 +1812,7 @@ describe('CheckoutService (integration)', () => {
       );
 
     const countCheckouts = (cartId: bigint) =>
-      prisma.checkout.count({ where: { cart_id: cartId } });
+      asTenant((tx) => tx.checkout.count({ where: { cart_id: cartId } }));
 
     const countOrders = () =>
       inTenant((tx) => tx.order.count({ where: { store_id: fx.storeId } }));
@@ -1651,10 +1842,10 @@ describe('CheckoutService (integration)', () => {
       await place(cart.token);
       await place(cart.token);
 
-      const checkout = await prisma.checkout.findFirst({
+      const checkout = await asTenant((tx) => tx.checkout.findFirst({
         where: { cart_id: cart.id },
         select: { id: true },
-      });
+      }));
 
       const intents = await inTenant((tx) =>
         tx.paymentIntent.findMany({
@@ -1712,10 +1903,10 @@ describe('CheckoutService (integration)', () => {
         expect(await countCheckouts(cart.id)).toBe(1);
         expect(pendingCalls).toBe(1);
 
-        const checkout = await prisma.checkout.findFirst({
+        const checkout = await asTenant((tx) => tx.checkout.findFirst({
           where: { cart_id: cart.id },
           select: { id: true },
-        });
+        }));
 
         const intents = await inTenant((tx) =>
           tx.paymentIntent.count({
@@ -1879,9 +2070,9 @@ describe('CheckoutService (integration)', () => {
         ),
       ).toBe(0);
 
-      const checkouts = await prisma.checkout.findMany({
+      const checkouts = await asTenant((tx) => tx.checkout.findMany({
         where: { cart_id: cart.id },
-      });
+      }));
       expect(checkouts).toHaveLength(1);
       expect(checkouts[0].status).toBe('failed');
       expect(checkouts[0].order_id).toBeNull();
@@ -1977,9 +2168,9 @@ describe('CheckoutService (integration)', () => {
       expect(await countOrders()).toBe(0);
 
       // The checkout TX1 committed is terminal, and carries no order.
-      const losers = await prisma.checkout.findMany({
+      const losers = await asTenant((tx) => tx.checkout.findMany({
         where: { cart_id: cart.id },
-      });
+      }));
       expect(losers).toHaveLength(1);
       expect(losers[0].status).toBe('failed');
       expect(losers[0].order_id).toBeNull();
@@ -2008,15 +2199,20 @@ describe('CheckoutService (integration)', () => {
 
       // A second LIVE checkout for the same cart is impossible at the
       // storage layer, independently of any application logic.
+      // Inside tenant context, so what refuses this is the UNIQUE INDEX
+      // and not the RLS policy — otherwise this test would pass for the
+      // wrong reason and stop proving the storage-layer backstop exists.
       await expect(
-        prisma.$executeRaw`
-          INSERT INTO checkouts
-            (store_id, mode, token, status, currency, quote_total_minor,
-             cart_id, expires_at, updated_at)
-          VALUES
-            (${fx.storeId}, 'live', 'live-two', 'pending_payment', 'USD', 100,
-             ${cart.id}, now() + interval '1 hour', now())
-        `,
+        inTenant(
+          (tx) => tx.$executeRaw`
+            INSERT INTO checkouts
+              (store_id, mode, token, status, currency, quote_total_minor,
+               cart_id, expires_at, updated_at)
+            VALUES
+              (${fx.storeId}, 'live', 'live-two', 'pending_payment', 'USD', 100,
+               ${cart.id}, now() + interval '1 hour', now())
+          `,
+        ),
       ).rejects.toThrow();
     });
 
@@ -2024,18 +2220,20 @@ describe('CheckoutService (integration)', () => {
       // The whole history of this table has cart_id NULL, so the index
       // must not be able to fire on any of it.
       for (const token of ['legacy-a', 'legacy-b', 'legacy-c']) {
-        await prisma.$executeRaw`
-          INSERT INTO checkouts
-            (store_id, mode, token, status, currency, quote_total_minor,
-             expires_at, updated_at)
-          VALUES
-            (${fx.storeId}, 'live', ${token}, 'pending_payment', 'USD', 100,
-             now() + interval '1 hour', now())
-        `;
+        await inTenant(
+          (tx) => tx.$executeRaw`
+            INSERT INTO checkouts
+              (store_id, mode, token, status, currency, quote_total_minor,
+               expires_at, updated_at)
+            VALUES
+              (${fx.storeId}, 'live', ${token}, 'pending_payment', 'USD', 100,
+               now() + interval '1 hour', now())
+          `,
+        );
       }
 
       expect(
-        await prisma.checkout.count({ where: { cart_id: null } }),
+        await asTenant((tx) => tx.checkout.count({ where: { cart_id: null } })),
       ).toBeGreaterThanOrEqual(3);
     });
 
@@ -2045,9 +2243,9 @@ describe('CheckoutService (integration)', () => {
       const cart = await newCart(1);
       const created = await place(cart.token);
 
-      const checkout = await prisma.checkout.findFirst({
+      const checkout = await asTenant((tx) => tx.checkout.findFirst({
         where: { cart_id: cart.id },
-      });
+      }));
       expect(checkout!.token).toBe(created.checkout_token);
 
       await expect(
@@ -2067,9 +2265,9 @@ describe('CheckoutService (integration)', () => {
       );
       expect(line!.quantity).toBe(1);
 
-      const after = await prisma.checkout.findFirst({
+      const after = await asTenant((tx) => tx.checkout.findFirst({
         where: { id: checkout!.id },
-      });
+      }));
       expect(after!.quote_total_minor).toBe(checkout!.quote_total_minor);
     });
 
@@ -2112,10 +2310,10 @@ describe('CheckoutService (integration)', () => {
       expect(two.checkout_token).not.toBe(one.checkout_token);
       expect(await countOrders()).toBe(2);
 
-      const rows = await prisma.checkout.findMany({
+      const rows = await asTenant((tx) => tx.checkout.findMany({
         where: { store_id: fx.storeId },
         select: { cart_id: true },
-      });
+      }));
       expect(rows.length).toBeGreaterThanOrEqual(2);
       for (const row of rows) expect(row.cart_id).toBeNull();
     });
@@ -2126,9 +2324,9 @@ describe('CheckoutService (integration)', () => {
       const cart = await newCart(2);
       await place(cart.token);
 
-      const checkout = await prisma.checkout.findFirst({
+      const checkout = await asTenant((tx) => tx.checkout.findFirst({
         where: { cart_id: cart.id },
-      });
+      }));
 
       expect(checkout!.quote_hash).toMatch(/^[0-9a-f]{64}$/);
 
@@ -2202,10 +2400,10 @@ describe('CheckoutService (integration)', () => {
       // The body claims one; the cart holds three.
       const placed = await placeOffline(cart.token);
 
-      const checkout = await prisma.checkout.findFirst({
+      const checkout = await asTenant((tx) => tx.checkout.findFirst({
         where: { cart_id: cart.id },
         include: { items: true },
-      });
+      }));
 
       expect(checkout!.items).toHaveLength(1);
       expect(checkout!.items[0].quantity).toBe(3);
@@ -2279,10 +2477,13 @@ describe('CheckoutService (integration)', () => {
         cart.token,
       );
 
-      const checkout = await prisma.checkout.findFirst({
+      // Read in the OTHER store's context — the checkout was created
+      // there, so under RLS it is invisible from this one. That it is
+      // invisible from here is asserted on its own above.
+      const checkout = await asTenant((tx) => tx.checkout.findFirst({
         where: { token: placed.checkout_token },
         select: { cart_id: true, store_id: true },
-      });
+      }), other.storeId);
 
       expect(checkout!.store_id).toBe(other.storeId);
       expect(checkout!.cart_id).toBeNull();

@@ -164,10 +164,27 @@ export const idempotencyConfig = registerAs<IdempotencyConfig>(
   }),
 );
 export const tenantConfig = registerAs<TenantConfig>('tenant', () => ({
-  guardEnabled: parseBoolOr(
-    process.env.TENANT_GUARD_ENABLED,
-    process.env.NODE_ENV !== 'production',
-  ),
+  /*
+   * ON EVERYWHERE, production included.
+   *
+   * This used to default to `NODE_ENV !== 'production'`, which switched
+   * the isolation net OFF in the one environment where a cross-tenant
+   * read is an incident rather than a test failure. The guard is
+   * REPORT-ONLY (see `createTenantGuardExtension`): it does not rewrite
+   * a query, does not add conditions, and does not refuse anything
+   * unless `throwOnViolation` is separately turned on — which it still
+   * is not, by default, anywhere. So the only thing this default ever
+   * suppressed in production was the warning.
+   *
+   * That matters here because the application-level guard is not
+   * redundant with RLS: `checkouts` and `checkout_items` carry
+   * `store_id` and `mode` but have no row-level security enabled, so
+   * for those tables this inspection is the ONLY thing that notices a
+   * query that forgot its store scope.
+   *
+   * Still overridable: set TENANT_GUARD_ENABLED=false to turn it off.
+   */
+  guardEnabled: parseBoolOr(process.env.TENANT_GUARD_ENABLED, true),
   throwOnViolation: parseBoolOr(
     process.env.TENANT_GUARD_THROW_ON_VIOLATION,
     false,

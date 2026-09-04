@@ -1,4 +1,8 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common'
+import {
+  ForbiddenException,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common'
 import { ActiveStoreGuard } from './active-store.guard'
 import { TenantContextService } from '../common/tenant/tenant-context.service'
 
@@ -177,18 +181,34 @@ describe('ActiveStoreGuard', () => {
   })
 
   describe('without an authenticated user', () => {
-    it('defers to the auth guard and resolves no store', async () => {
-      // SessionAuthGuard runs first (controller-level) and rejects the
-      // request. If it were ever removed, this guard must not invent a
-      // store — it resolves nothing and sets nothing.
+    it('refuses the request rather than passing it on unscoped', async () => {
+      /*
+       * FAIL CLOSED, and this assertion is the point of the change.
+       *
+       * Every route that mounts this guard today also mounts
+       * SessionAuthGuard at the controller level, so in practice the
+       * auth guard rejects first and this branch is unreachable. It
+       * used to `return true` anyway, and that was a fail-open waiting
+       * for its first caller: a route added later with
+       * `@UseGuards(ActiveStoreGuard)` and no auth guard in front would
+       * have been allowed through with no identity AND no store.
+       *
+       * The damage would not have stopped at a late rejection.
+       * `request.activeStoreId` stays undefined, `@ActiveStoreId()`
+       * hands the service `undefined`, and Prisma DROPS
+       * `where: { store_id: undefined }` instead of failing — turning a
+       * query that was meant to be scoped to one store into a query
+       * across every store. The tenant guard cannot catch it either,
+       * because TenantContext was never populated.
+       */
       const request = makeRequest({ user: undefined })
 
-      const { allowed, storeId } = await run(request)
+      await expect(run(request)).rejects.toThrow(UnauthorizedException)
 
-      expect(allowed).toBe(true)
+      // And it refuses without resolving or publishing anything.
       expect(resolve).not.toHaveBeenCalled()
       expect(request.activeStore).toBeUndefined()
-      expect(storeId).toBeNull()
+      expect(request.activeStoreId).toBeUndefined()
     })
 
     it('accepts a JWT-shaped user whose id lives on `sub`', async () => {

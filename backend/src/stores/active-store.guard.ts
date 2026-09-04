@@ -1,4 +1,9 @@
-import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common'
+import {
+  CanActivate,
+  ExecutionContext,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common'
 import { ActiveStoreService } from './active-store.service'
 import { TenantContextService } from '../common/tenant/tenant-context.service'
 
@@ -36,9 +41,27 @@ export class ActiveStoreGuard implements CanActivate {
 
     const userId = request.user?.id ?? request.user?.sub
     if (!userId) {
-      // من المفروض الـ Auth Guard اللي قبله يكون رفض الطلب قبل ما يوصل
-      // هنا أصلاً. منكررش خطأ Auth هنا — الـ Auth Guard هو المسؤول عنه.
-      return true
+      /*
+       * ⚠️ بيرفض، مابيعديش.
+       *
+       * كل الراوتس الموجودة دلوقتي وراها SessionAuthGuard على مستوى
+       * الكنترولر، فالفرع ده مابيتنفذش في أي مسار حالي — الحارس ده
+       * بيرمي قبل ما نوصل هنا أصلاً. لكن الفرع نفسه كان بيرجّع true،
+       * وده fail-open: أي راوت يتضاف بكرة بـ @UseGuards(ActiveStoreGuard)
+       * من غير حارس Auth قبله كان هيعدّي من غير مصادقة ومن غير سياق
+       * متجر خالص.
+       *
+       * والنتيجة مش مجرد طلب مرفوض متأخر: request.activeStoreId بيفضل
+       * undefined، و@ActiveStoreId() بيرجّع undefined، و Prisma
+       * بيتجاهل `where: { store_id: undefined }` بدل ما يفشل — يعني
+       * استعلام كان مفروض يتقيّد بمتجر واحد بيتحوّل لاستعلام على كل
+       * المتاجر. وحارس العزل نفسه (tenant guard) مابيشوفش حاجة لأن
+       * TenantContext فاضي.
+       *
+       * fail-closed هو السلوك الصح هنا: حارس المتجر مالوش معنى من غير
+       * هوية، فبدل ما يعدّي على فراغ يرفض.
+       */
+      throw new UnauthorizedException('Authentication required')
     }
 
     const storeIdentifier: string | null =
